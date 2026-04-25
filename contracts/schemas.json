@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Nexus Entity",
+  "type": "object",
+  "required": ["type", "coreData"],
+  "properties": {
+    "type": { "enum": ["PERSON", "ORGANIZATION"] },
+    "coreData": {
+      "type": "object",
+      "required": ["displayName", "email"],
+      "properties": {
+        "email": { "format": "email" }
+      }
+    }
+  }
+}

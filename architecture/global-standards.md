@@ -1,6 +1,18 @@
-definisce come i servizi devono rispondere (formato JSON, gestione errori, header X-Nexus-*).
+## 🚨 Protocollo Gestione Errori
+Ogni microservizio deve mappare i propri errori interni nei seguenti codici Nexus standard:
 
-Da implementare
+| Codice Nexus | HTTP Status | Descrizione |
+| :--- | :--- | :--- |
+| `ERR_UNAUTHORIZED` | 401 | Token mancante o non valido. |
+| `ERR_FORBIDDEN` | 403 | Permessi insufficienti per la risorsa/azione. |
+| `ERR_NOT_FOUND` | 404 | Risorsa non trovata su Firestore. |
+| `ERR_IMMUTABLE_RECORD` | 409 | Tentativo di modifica di un record locked (Logica ERP). |
+| `ERR_VALIDATION_FAILED` | 400 | Payload non conforme allo schema JSON. |
+| `ERR_INTERNAL` | 500 | Errore generico lato server o GCP. |
+
+## 📡 Headers Obbligatori
+Oltre a `X-Nexus-User-ID` e `X-Nexus-Role`, aggiungiamo:
+- `X-Nexus-Trace-ID`: Per il logging distribuito (Cloud Trace).
 
 ## 📋 Standard per il ssg-nexus-doc-project
 Aggiungi queste regole nella sezione global-standards.md:

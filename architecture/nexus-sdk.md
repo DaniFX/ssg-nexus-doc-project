@@ -110,3 +110,30 @@ func (r *Repository) Create(ctx context.Context, id string, data map[string]inte
 	return err
 }
 ```
+
+```
+// pkg/nexus/repository.go (Estensione)
+
+// SoftDelete imposta il campo deletedAt invece di rimuovere il record
+func (r *Repository) SoftDelete(ctx context.Context, id string) error {
+	_, err := r.client.Collection(r.collection).Doc(id).Update(ctx, []firestore.Update{
+		{Path: "deletedAt", Value: firestore.ServerTimestamp},
+		{Path: "updatedAt", Value: firestore.ServerTimestamp},
+	})
+	return err
+}
+
+// CheckImmutability verifica se un documento può essere modificato
+func (r *Repository) IsLocked(ctx context.Context, id string) (bool, error) {
+	doc, err := r.client.Collection(r.collection).Doc(id).Get(ctx)
+	if err != nil {
+		return false, err
+	}
+	
+	// Cerca il flag immutable o lo stato ISSUED tipico del Finance
+	immutable, _ := doc.Data()["immutable"].(bool)
+	status, _ := doc.Data()["status"].(string)
+	
+	return immutable || status == "ISSUED", nil
+}
+```

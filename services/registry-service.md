@@ -49,6 +49,7 @@ PATCH /entities/:id: Aggiornamento parziale (senza alterare lo storico critico).
 #### 🚀 Azioni suggerite per il repo ssg-nexus-doc-project:
 Crea una cartella /architecture: Inserisci un file global-standards.md che definisca come i servizi devono rispondere (formato JSON, gestione errori, header X-Nexus-*).
 
-Crea una cartella /services: Inserisci il file registry-service.md sopra descritto.
-
-File README.md: Definisci la visione di SSG Nexus come sistema unificato.
+## 🧪 Logiche di Validazione (Business Rules)
+- **Unicità**: Il servizio deve verificare che `coreData.taxCode` sia univoco all'interno della collezione `entities`.
+- **Integrità**: Se `type == ORGANIZATION`, il campo `coreData.vatNumber` diventa obbligatorio.
+- **Relazioni**: Prima di eliminare (soft-delete) un'entità, il servizio deve interrogare il `Finance Service` per assicurarsi che non ci siano fatture `PENDING`.
