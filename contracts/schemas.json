@@ -1,16 +1,221 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Nexus Entity",
-  "type": "object",
-  "required": ["type", "coreData"],
-  "properties": {
-    "type": { "enum": ["PERSON", "ORGANIZATION"] },
-    "coreData": {
+  "title": "SSG Nexus — Contratti JSON Schema",
+  "description": "Source of truth per la validazione dei payload dei microservizi Nexus",
+  "definitions": {
+
+    "NexusDoc": {
+      "description": "Campi base presenti in ogni documento Firestore Nexus",
       "type": "object",
-      "required": ["displayName", "email"],
       "properties": {
-        "email": { "format": "email" }
+        "id":        { "type": "string", "description": "Identificatore univoco Firestore" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "description": "Firebase UID dell'autore" },
+        "deletedAt": { "type": ["string", "null"], "format": "date-time", "description": "Soft delete timestamp" },
+        "immutable": { "type": "boolean", "default": false, "description": "Se true, UPDATE e DELETE sono bloccati dall'SDK" }
+      }
+    },
+
+    "NexusEntity": {
+      "description": "Anagrafica polimorfica del Registry Service",
+      "allOf": [{ "$ref": "#/definitions/NexusDoc" }],
+      "type": "object",
+      "required": ["type", "subType", "coreData"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["PERSON", "ORGANIZATION"],
+          "description": "Tipo primario dell'entità"
+        },
+        "subType": {
+          "type": "string",
+          "description": "Ruolo funzionale: MEMBER, CUSTOMER, SUPPLIER, EMPLOYEE, PARTNER..."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ACTIVE", "INACTIVE", "SUSPENDED"],
+          "default": "ACTIVE"
+        },
+        "coreData": {
+          "type": "object",
+          "required": ["displayName", "email"],
+          "properties": {
+            "displayName": { "type": "string", "minLength": 1, "description": "Nome o ragione sociale" },
+            "email":       { "type": "string", "format": "email" },
+            "phone":       { "type": "string" },
+            "taxCode":     { "type": "string", "description": "Codice fiscale — univoco nella collection" },
+            "vatNumber":   { "type": "string", "description": "Partita IVA — obbligatoria se type==ORGANIZATION" },
+            "address": {
+              "type": "object",
+              "properties": {
+                "street":  { "type": "string" },
+                "city":    { "type": "string" },
+                "zip":     { "type": "string" },
+                "country": { "type": "string", "default": "IT" }
+              }
+            }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Campi extra specifici per subType, validati runtime",
+          "additionalProperties": true
+        }
+      },
+      "if": { "properties": { "type": { "const": "ORGANIZATION" } } },
+      "then": { "required": ["coreData"], "properties": { "coreData": { "required": ["vatNumber"] } } }
+    },
+
+    "NexusDocument": {
+      "description": "Documento fisico gestito dal Document Service (File + GCS + Firestore)",
+      "allOf": [{ "$ref": "#/definitions/NexusDoc" }],
+      "type": "object",
+      "required": ["name", "mimeType", "storageUrl", "relation"],
+      "properties": {
+        "name":       { "type": "string", "description": "Nome file con estensione" },
+        "mimeType":   { "type": "string", "description": "Es. application/pdf, image/jpeg" },
+        "size":       { "type": "integer", "description": "Dimensione in byte" },
+        "storageUrl": { "type": "string", "format": "uri", "description": "URL GCS del file fisico" },
+        "signedUrl": {
+          "type": ["string", "null"],
+          "format": "uri",
+          "description": "Signed URL temporaneo per download — non persistito su Firestore"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING_UPLOAD", "ACTIVE", "ARCHIVED", "DELETED"],
+          "default": "PENDING_UPLOAD"
+        },
+        "relation": {
+          "type": "object",
+          "required": ["parentType", "parentId"],
+          "description": "Entità a cui il documento è collegato",
+          "properties": {
+            "parentType": { "type": "string", "enum": ["ENTITY", "INVOICE", "LEDGER_ENTRY"] },
+            "parentId":   { "type": "string" }
+          }
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Etichette per la ricerca e il filtering"
+        },
+        "ocrText": {
+          "type": ["string", "null"],
+          "description": "Testo estratto via OCR, se disponibile"
+        }
+      }
+    },
+
+    "NexusInvoice": {
+      "description": "Fattura / Nota di Credito / Ricevuta del Finance Service",
+      "allOf": [{ "$ref": "#/definitions/NexusDoc" }],
+      "type": "object",
+      "required": ["type", "direction", "issuer", "receiver", "items", "totals", "dates"],
+      "properties": {
+        "externalId": { "type": "string", "description": "SDI ID o ref. sistema esterno" },
+        "type": {
+          "type": "string",
+          "enum": ["INVOICE", "CREDIT_NOTE", "RECEIPT"]
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["INBOUND", "OUTBOUND"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["DRAFT", "ISSUED", "PAID", "OVERDUE", "CANCELLED"],
+          "default": "DRAFT"
+        },
+        "issuer": { "$ref": "#/definitions/FiscalParty" },
+        "receiver": { "$ref": "#/definitions/FiscalParty" },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/InvoiceItem" }
+        },
+        "totals": {
+          "type": "object",
+          "required": ["net", "tax", "gross", "currency"],
+          "properties": {
+            "net":      { "type": "number", "minimum": 0 },
+            "tax":      { "type": "number", "minimum": 0 },
+            "gross":    { "type": "number", "minimum": 0 },
+            "currency": { "type": "string", "default": "EUR", "pattern": "^[A-Z]{3}$" }
+          }
+        },
+        "dates": {
+          "type": "object",
+          "required": ["document"],
+          "properties": {
+            "document": { "type": "string", "format": "date-time" },
+            "due":      { "type": ["string", "null"], "format": "date-time" },
+            "paid":     { "type": ["string", "null"], "format": "date-time" }
+          }
+        },
+        "documentRef": {
+          "type": ["string", "null"],
+          "description": "ID del NexusDocument allegato (PDF fattura)"
+        }
+      }
+    },
+
+    "NexusLedgerEntry": {
+      "description": "Movimento contabile del libro giornale (Finance Service)",
+      "allOf": [{ "$ref": "#/definitions/NexusDoc" }],
+      "type": "object",
+      "required": ["entityId", "invoiceId", "amount", "type", "method", "timestamp"],
+      "properties": {
+        "entityId":  { "type": "string", "description": "ID NexusEntity del soggetto" },
+        "invoiceId": { "type": "string", "description": "ID NexusInvoice di riferimento" },
+        "amount":    { "type": "number", "minimum": 0.01 },
+        "type": {
+          "type": "string",
+          "enum": ["DEBIT", "CREDIT"]
+        },
+        "method": {
+          "type": "string",
+          "enum": ["STRIPE", "BANK_TRANSFER", "CASH", "OTHER"]
+        },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "note": {
+          "type": ["string", "null"],
+          "description": "Nota libera per la riconciliazione manuale"
+        }
+      }
+    },
+
+    "FiscalParty": {
+      "description": "Snapshot fiscale immutabile di issuer/receiver al momento dell'emissione",
+      "type": "object",
+      "required": ["entityId", "name"],
+      "properties": {
+        "entityId": { "type": "string" },
+        "name":     { "type": "string" },
+        "vat":      { "type": "string" },
+        "taxCode":  { "type": "string" }
+      }
+    },
+
+    "InvoiceItem": {
+      "type": "object",
+      "required": ["description", "quantity", "unitPrice", "vatRate", "total"],
+      "properties": {
+        "description": { "type": "string" },
+        "quantity":    { "type": "number", "minimum": 0 },
+        "unitPrice":   { "type": "number", "minimum": 0 },
+        "vatRate":     { "type": "number", "minimum": 0, "maximum": 100, "description": "Aliquota IVA %" },
+        "total":       { "type": "number", "minimum": 0 }
       }
     }
-  }
+
+  },
+
+  "oneOf": [
+    { "$ref": "#/definitions/NexusEntity" },
+    { "$ref": "#/definitions/NexusDocument" },
+    { "$ref": "#/definitions/NexusInvoice" },
+    { "$ref": "#/definitions/NexusLedgerEntry" }
+  ]
 }
