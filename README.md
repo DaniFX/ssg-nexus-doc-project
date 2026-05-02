@@ -73,3 +73,170 @@
 ---
 
 ## 4. Flusso di Autenticazione
+Client --> [Authorization: Bearer <JWT>] --> SSG Gateway
+|
+1. Verifica JWT (firebase-admin)
+2. Estrae uid -> X-Nexus-User-ID
+3. Estrae role -> X-Nexus-Role
+4. Genera X-Nexus-Trace-ID
+|
+[VPC interna, header iniettati]
+|
++-----------------+-----------------+-----------------+
+| Registry Service| Document Service| Finance Service |
+### Header Standard Nexus
+
+| Header | Contenuto | Obbligatorio |
+|---|---|---|
+| `X-Nexus-User-ID` | Firebase UID | ✅ Sì |
+| `X-Nexus-Role` | Ruolo da custom claims | ✅ Sì |
+| `X-Nexus-Trace-ID` | ID tracing distribuito | ✅ Sì |
+
+> **Regola**: Ogni microservizio verifica `X-Nexus-User-ID` via middleware `NexusGuard`. Assenza → `401 ERR_UNAUTHORIZED`.
+
+---
+
+## 5. Nexus SDK (Go)
+
+Libreria interna Go 1.21+ in `ssg-nexus-sdk`. Obbligatoria per tutti i microservizi.
+
+### 5.1 NexusGuard Middleware
+Verifica `X-Nexus-User-ID` e inietta identità nel `context.Context`.
+
+### 5.2 Standard Responder
+
+**Successo:** `{ "success": true, "data": {...}, "meta": {...} }`  
+**Errore:** `{ "success": false, "error": { "code": "ERR_CODE", "message": "..." } }`
+
+### 5.3 Firestore Repository Wrapper
+
+- Iniezione automatica `createdAt`, `updatedAt`, `createdBy`
+- `SoftDelete()` → imposta `deletedAt`
+- `IsLocked()` → controlla `immutable` o `status == ISSUED`
+- `ApplyNavigator()` → traduce query string in query Firestore
+
+### 5.4 NexusDoc (Struct Base)
+
+```go
+type NexusDoc struct {
+    ID        string     `firestore:"id"`
+    CreatedAt time.Time  `firestore:"createdAt"`
+    UpdatedAt time.Time  `firestore:"updatedAt"`
+    CreatedBy string     `firestore:"createdBy"`
+    DeletedAt *time.Time `firestore:"deletedAt,omitempty"`
+    Immutable bool       `firestore:"immutable"`
+}
+```
+
+### 5.5 Service Discovery
+Ogni microservizio espone `/_discover` implementato dall'SDK per il routing dinamico del Gateway.
+
+---
+
+## 6. Servizi di Dominio
+
+### 6.1 Registry Service — `ssg-registry-service`
+**Collezione Firestore**: `entities`  
+Gestisce anagrafiche polimorfiche: PERSON / ORGANIZATION con subTypes (MEMBER, CUSTOMER, SUPPLIER).
+
+**Business Rules:**
+- `taxCode` univoco nella collezione
+- `vatNumber` obbligatorio se `type == ORGANIZATION`
+- Prima del soft-delete verificare assenza fatture `PENDING` nel Finance Service
+
+| Metodo | Path | Descrizione |
+|---|---|---|
+| GET | `/entities` | Lista via Navigator |
+| POST | `/entities` | Creazione con validazione fiscale |
+| GET | `/entities/:id` | Dettaglio completo |
+| PATCH | `/entities/:id` | Aggiornamento parziale |
+| DELETE | `/entities/:id` | Soft delete |
+
+---
+
+### 6.2 Document Service — `ssg-nexus-document-service`
+**Collezione Firestore**: `documents`  
+Ponte tra GCS (fisico) e Firestore (logico). Ogni file è un "attachment" collegato a ENTITY, INVOICE o PROJECT.
+
+**Flusso Upload (Signed URL):**
+1. Frontend richiede Signed URL al servizio
+2. Verifica permessi → restituzione URL temporaneo GCS
+3. Upload diretto del file su GCS
+4. Conferma → creazione record Firestore + eventuali analisi
+
+**Query documenti di un'entità:**
+
+GET /documents?relation.parentType=ENTITY&relation.parentId={id}
+
+
+---
+
+### 6.3 Finance Service — `ssg-finance-service`
+**Collezioni Firestore**: `invoices`, `ledger_entries`  
+Modulo ERP per ciclo attivo/passivo, conformità fiscale e riconciliazione.
+
+**Business Rules ERP:**
+- Numerazione sequenziale fatture OUTBOUND per anno fiscale
+- `status → ISSUED` → `immutable: true` → blocco UPDATE/DELETE
+- Riconciliazione automatica: somma `ledger_entries` >= `totals.gross` → `status = PAID`
+- Snapshot fiscale immutabile di issuer/receiver al momento dell'emissione
+
+---
+
+## 7. Standard Globali
+
+### Codici Errore Nexus
+
+| Codice | HTTP | Quando |
+|---|---|---|
+| `ERR_UNAUTHORIZED` | 401 | Header `X-Nexus-User-ID` assente |
+| `ERR_FORBIDDEN` | 403 | Ruolo insufficiente |
+| `ERR_NOT_FOUND` | 404 | Risorsa non trovata in Firestore |
+| `ERR_IMMUTABLE_RECORD` | 409 | Record locked (ERP) |
+| `ERR_VALIDATION_FAILED` | 400 | Payload non conforme allo schema |
+| `ERR_INTERNAL` | 500 | Errore server/GCP |
+
+### Regole di Integrità
+- Mai `Delete()` diretto su Firestore per dati ERP → solo `SoftDelete()`
+- Ogni scrittura include `createdBy` da `X-Nexus-User-ID`
+- `taxCode` e `vatNumber` univoci in `entities`
+
+### Navigator — Query Standard
+
+| Parametro | Esempio | Comportamento |
+|---|---|---|
+| `sort` | `?sort=-createdAt` | Ordine discendente |
+| `sort` | `?sort=status` | Ordine ascendente |
+| `limit` | `?limit=20` | Max risultati |
+| `<campo>` | `?status=PAID` | Filtro uguaglianza |
+
+---
+
+## 8. Contratti e JSON Schema
+
+I contratti formali sono in `/contracts/schemas.json`.
+
+> ⚠️ **TODO**: Espandere con schemi per `Invoice`, `Document` e `LedgerEntry`.
+
+---
+
+## 9. Open Issues e Roadmap
+
+| Priorità | Issue | Azione |
+|---|---|---|
+| 🔴 Alta | `services/inance-service.md` — nome errato | Rinominare in `finance-service.md` |
+| 🟡 Media | `contracts/schemas.json` — incompleto | Aggiungere Invoice, Document, LedgerEntry |
+| 🟡 Media | `ssg-mail-reader-service` — non documentato | Aggiungere `services/mail-reader-service.md` |
+| 🟢 Bassa | `/_discover` — non testato e2e | Definire test di integrazione |
+
+### Roadmap Documentale
+- [ ] Rinominare `inance-service.md` → `finance-service.md`
+- [ ] Espandere `/contracts/schemas.json`
+- [ ] Aggiungere `services/gateway.md`
+- [ ] Aggiungere `architecture/deployment.md`
+- [ ] Aggiungere `architecture/data-flows.md`
+- [ ] Introdurre sezione `adr/` per Architecture Decision Records
+
+---
+
+*Documento creato il 2026-05-02 — da aggiornare ad ogni decisione architetturale rilevante.*
