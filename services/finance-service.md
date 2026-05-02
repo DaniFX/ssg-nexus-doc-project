@@ -1,38 +1,59 @@
 # 💰 SSG Finance Service — Specifiche Tecniche
 
 > **Repository:** [`ssg-finance-service`](https://github.com/DaniFX/ssg-finance-service)
-> **Stack:** Go 1.21+, Gin, Firestore, `ssg-nexus-sdk`
-> **Ruolo:** Modulo ERP di SSG Nexus. Gestisce il ciclo di vita delle fatture (DRAFT → ISSUED → PAID), la registrazione dei pagamenti nel libro giornale e la riconciliazione automatica.
+> **Stack:** Go 1.21+, Gin, Firestore (GCP), `ssg-nexus-sdk`
+> **Ruolo:** Motore finanziario di SSG Nexus. Gestisce il ciclo di vita delle fatture (DRAFT → ISSUED → PAID), il libro giornale dei pagamenti e la riconciliazione automatica. Interagisce con `ssg-nexus-document-service` per la generazione dei PDF.
 
 ---
 
-## 1. Struttura del Progetto
+## 1. Principi Architetturali
+
+### 1.1 Locking ERP (Immutabilità)
+
+Una fattura emessa (`ISSUED`) è **immutabile**. Il servizio implementa un doppio controllo:
+
+- `invoice.Status == StatusIssued` → già emessa
+- `invoice.Metadata["immutable"] == true` → flag di lock esplicito
+
+Qualsiasi tentativo di modifica restituisce `ERP_LOCK_ERROR`. Il flag `immutable` viene impostato dal servizio stesso al momento dell’emissione, mai dal client.
+
+### 1.2 Riconciliazione Automatica
+
+Ogni pagamento registrato nel ledger triggera una riconciliazione automatica: si sommano tutti i `LedgerEntry.Amount` per la fattura e, se il totale `>= invoice.Totals.Gross`, la fattura passa automaticamente a `PAID` con `Dates.Paid` valorizzato.
+
+### 1.3 Integrazione Document Service
+
+Al momento dell’emissione (`IssueInvoice`), il Finance Service chiama via HTTP `ssg-nexus-document-service` all’endpoint `POST /api/v1/documents/generate`. Il `documentId` restituito viene salvato nel campo `Invoice.DocumentRef`.
+
+---
+
+## 2. Struttura del Progetto
 
 ```
 ssg-finance-service/
 ├── cmd/
-│   └── finance-service/
-│       └── main.go              # Bootstrap: Firestore, FinanceService, Routes
+│   └── finance/
+│       └── main.go                  # Bootstrap, discovery, guard, routes
 ├── internal/
 │   ├── handlers/
-│   │   ├── invoices.go          # IssueInvoice (PATCH /invoices/:id/issue)
-│   │   ├── ledger.go            # RegisterTransaction (POST /ledger)
-│   │   └── discovery.go        # GetDiscovery (GET /_discover)
+│   │   ├── discovery.go             # Handler /_discover
+│   │   ├── invoices.go              # IssueInvoice handler
+│   │   └── ledger.go                # RegisterTransaction handler
 │   ├── models/
-│   │   ├── invoice.go           # Invoice, InvoiceDates, Totals, Entity, InvoiceStatus
-│   │   └── ledger.go            # LedgerEntry
+│   │   ├── invoice.go               # Invoice, InvoiceDates, Totals, Entity
+│   │   └── ledger.go                # LedgerEntry
 │   ├── repository/
-│   │   └── firestore.go         # FinanceRepository: GetInvoice, UpdateInvoice, SaveLedgerEntry, GetTotalPaidForInvoice
+│   │   └── firestore.go             # FinanceRepository: invoices + ledger_entries
 │   └── services/
-│       └── finance_service.go   # FinanceService: UpdateInvoice, IssueInvoice, RegisterPayment, generateDocument
+│       └── finance_service.go       # Business logic: UpdateInvoice, IssueInvoice, RegisterPayment
 └── Dockerfile
 ```
 
 ---
 
-## 2. Modelli Dati
+## 3. Modelli Dati
 
-### 2.1 Invoice — `internal/models/invoice.go`
+### 3.1 `Invoice` — `internal/models/invoice.go`
 
 ```go
 type InvoiceStatus string
@@ -45,254 +66,277 @@ const (
 )
 
 type Invoice struct {
-    ID          string         `json:"id"          firestore:"id"`
-    ExternalID  string         `json:"externalId"  firestore:"externalId"`  // es. SDI-2026-abc123
-    Type        string         `json:"type"        firestore:"type"`
-    Status      InvoiceStatus  `json:"status"      firestore:"status"`
-    Issuer      Entity         `json:"issuer"      firestore:"issuer"`      // snapshot da Registry
-    Receiver    Entity         `json:"receiver"    firestore:"receiver"`    // snapshot da Registry
-    Totals      Totals         `json:"totals"      firestore:"totals"`
-    Dates       InvoiceDates   `json:"dates"       firestore:"dates"`
-    DocumentRef string         `json:"documentRef" firestore:"documentRef"` // ID doc nel Document Service
-    Metadata    map[string]any `json:"metadata"    firestore:"metadata"`    // "immutable": true dopo ISSUED
+    ID          string         // UUID fattura
+    ExternalID  string         // Numero sequenziale SDI (es. "SDI-2026-abc123")
+    Type        string         // INVOICE | CREDIT_NOTE | ...
+    Status      InvoiceStatus  // DRAFT | ISSUED | PAID | CANCELLED
+    Issuer      Entity         // Snapshot emittente (da Registry)
+    Receiver    Entity         // Snapshot destinatario (da Registry)
+    Totals      Totals         // Gross + Currency
+    Dates       InvoiceDates   // document, due, paid
+    DocumentRef string         // ID documento in ssg-nexus-document-service
+    Metadata    map[string]any // immutable: true dopo emissione
 }
 
 type InvoiceDates struct {
-    Document time.Time  `json:"document" firestore:"document"`
-    Due      time.Time  `json:"due"      firestore:"due"`
-    Paid     *time.Time `json:"paid"     firestore:"paid"` // nil finché non pagata
-}
-
-type Totals struct {
-    Gross    float64 `json:"gross"    firestore:"gross"`
-    Currency string  `json:"currency" firestore:"currency"`
+    Document time.Time  // Data documento
+    Due      time.Time  // Scadenza pagamento
+    Paid     *time.Time // Null finché non pagata
 }
 
 type Entity struct {
-    EntityID string `json:"entityId" firestore:"entityId"`
-    Name     string `json:"name"     firestore:"name"`
-    VAT      string `json:"vat"      firestore:"vat"`
+    EntityID string // ID da Registry Service
+    Name     string
+    VAT      string
+}
+
+type Totals struct {
+    Gross    float64
+    Currency string // es. "EUR"
 }
 ```
 
-> ⚠️ **Snapshot fiscale:** `Issuer` e `Receiver` sono copie statiche dei dati Registry al momento dell'emissione. Non si aggiornano se i dati dell'entità cambiano in seguito.
+> **Design:** `Issuer` e `Receiver` sono **snapshot** copiati da Registry al momento della creazione della fattura. Sono immutabili rispetto alle modifiche successive all’anagrafica.
 
-> ⚠️ **Locking ERP:** Dopo `IssueInvoice()`, il campo `metadata["immutable"] = true` viene impostato nel codice Go. `UpdateInvoice()` controlla questo flag ed emette errore se la fattura è già emessa.
-
-### 2.2 LedgerEntry — `internal/models/ledger.go`
+### 3.2 `LedgerEntry` — `internal/models/ledger.go`
 
 ```go
 type LedgerEntry struct {
-    ID        string    `json:"id"        firestore:"id"`
-    EntityID  string    `json:"entityId"  firestore:"entityId"`
-    InvoiceID string    `json:"invoiceId" firestore:"invoiceId"`
-    Amount    float64   `json:"amount"    firestore:"amount"`
-    Type      string    `json:"type"      firestore:"type"`   // DEBIT | CREDIT
-    Method    string    `json:"method"    firestore:"method"` // STRIPE | BANK_TRANSFER
-    Timestamp time.Time `json:"timestamp" firestore:"timestamp"`
+    ID        string    // Auto-generato da Firestore se vuoto
+    EntityID  string    // Riferimento all'entità pagante
+    InvoiceID string    // Fattura di riferimento (obbligatorio)
+    Amount    float64   // Importo pagamento (> 0)
+    Type      string    // DEBIT | CREDIT
+    Method    string    // STRIPE | BANK_TRANSFER
+    Timestamp time.Time // Impostato dal service layer al momento del salvataggio
 }
 ```
 
-> `Timestamp` è impostato automaticamente dal service layer (`time.Now()`), non dal client.
-
 ---
 
-## 3. Logica di Business — `internal/services/finance_service.go`
+## 4. Service Layer
 
-Il `FinanceService` contiene tutta la business logic. Gli handler sono thin wrapper che delegano a questo layer.
+**File:** `internal/services/finance_service.go`
 
-### 3.1 `IssueInvoice` — Ciclo di vita DRAFT → ISSUED
+```go
+type FinanceService struct {
+    repo          repository.FinanceRepository
+    nexusClient   *nexus.NexusClient  // per chiamate inter-service
+    docServiceURL string              // URL ssg-nexus-document-service
+}
+```
+
+### 4.1 `UpdateInvoice` — Aggiornamento DRAFT con Lock
 
 ```
-DRAFT
+UpdateInvoice(ctx, inv)
   |
-  | [1] Verifica: status != ISSUED e metadata["immutable"] != true
-  | [2] Genera ExternalID: "SDI-{anno}-{id[:6]}"
-  | [3] HTTP POST al Document Service: /api/v1/documents/generate
-  |     Payload: { "type": "INVOICE", "data": <invoice> }
-  |     Risposta attesa: { "data": { "documentId": "..." } }
-  | [4] Imposta DocumentRef, Status = ISSUED, metadata["immutable"] = true
-  | [5] UpdateInvoice su Firestore
-  v
-ISSUED (immutabile)
+  | [1] GetInvoice(ctx, inv.ID) -> existing
+  | [2] Se existing.Status == ISSUED || existing.Metadata["immutable"] == true
+  |     -> return error "cannot update an issued invoice" (ERP Lock)
+  | [3] repo.UpdateInvoice(ctx, inv)
 ```
 
-**Errore codice:** `ERP_LOCK_ERROR` (HTTP 400) se la fattura è già emessa o già immutabile.
-
-> ⚠️ **Issue critico:** Il Finance Service chiama `POST /api/v1/documents/generate` sul Document Service, ma questo endpoint **non esiste** nel `ssg-nexus-document-service` attuale. Il Document Service espone solo `upload-url` e `finalize`. Vanno allineati.
-
-### 3.2 `RegisterPayment` — Registrazione e Riconciliazione Automatica
+### 4.2 `IssueInvoice` — Emissione + Documento + Lock
 
 ```
-POST /ledger
+IssueInvoice(ctx, invoiceID)
   |
-  | [1] Imposta entry.Timestamp = time.Now()
-  | [2] SaveLedgerEntry su Firestore (collection: ledger_entries)
-  | [3] GetTotalPaidForInvoice: somma tutti i ledger_entries per invoiceId
-  | [4] GetInvoice per recuperare totals.gross
-  | [5] Se totalPaid >= invoice.Totals.Gross → Status = PAID, Dates.Paid = now
-  | [6] UpdateInvoice su Firestore
-  v
-PAID (se soglia raggiunta)
+  | [1] repo.GetInvoice(ctx, invoiceID)
+  | [2] Verifica Lock: Status==ISSUED || Metadata["immutable"]==true
+  |     -> ERP_LOCK_ERROR
+  | [3] Genera ExternalID: "SDI-{year}-{id[:6]}"
+  | [4] generateDocument(ctx, invoice)
+  |     -> POST {DOCUMENT_SERVICE_URL}/api/v1/documents/generate
+  |     -> nexusClient.Do(ctx, req)   (chiamata inter-service autenticata)
+  |     -> Decode result.Data.DocumentID
+  | [5] invoice.DocumentRef = documentID
+  |     invoice.Status = "ISSUED"
+  |     invoice.Metadata["immutable"] = true
+  | [6] repo.UpdateInvoice(ctx, invoice)
 ```
 
-**Riconciliazione atomica lato applicazione:** il passaggio a PAID avviene nello stesso goroutine del pagamento, senza lock distribuiti. In caso di scrittura concorrente possono verificarsi race condition.
+### 4.3 `RegisterPayment` — Pagamento + Riconciliazione
 
-### 3.3 `UpdateInvoice` — Protezione DRAFT
-
-Permette modifiche solo se la fattura è in stato `DRAFT` e `metadata["immutable"]` è falso. Usato per aggiornamenti pre-emissione.
-
----
-
-## 4. Repository — `internal/repository/firestore.go`
-
-| Metodo | Collection | Operazione |
-|---|---|---|
-| `GetInvoice(ctx, id)` | `invoices` | `.Doc(id).Get()` |
-| `UpdateInvoice(ctx, inv)` | `invoices` | `.Doc(inv.ID).Set()` (upsert) |
-| `SaveLedgerEntry(ctx, entry)` | `ledger_entries` | `.Doc(entry.ID).Set()` — ID auto-generato da Firestore se vuoto |
-| `GetTotalPaidForInvoice(ctx, invoiceID)` | `ledger_entries` | `.Where("invoiceId", "==", id)` + somma Amount |
-
-> **Nota:** `UpdateInvoice` usa `.Set()` (upsert), non `.Update()` (patch). Sovrascrive l'intero documento — attenzione a non perdere campi non inclusi nella struct.
+```
+RegisterPayment(ctx, entry)
+  |
+  | [1] entry.Timestamp = time.Now()
+  | [2] repo.SaveLedgerEntry(ctx, entry)
+  | [3] repo.GetTotalPaidForInvoice(ctx, entry.InvoiceID)
+  |     -> SUM di tutti i LedgerEntry.Amount per invoiceID
+  | [4] repo.GetInvoice(ctx, entry.InvoiceID)
+  | [5] Se totalPaid >= invoice.Totals.Gross && Status != PAID
+  |     -> invoice.Status = "PAID"
+  |     -> invoice.Dates.Paid = &now
+  |     -> repo.UpdateInvoice(ctx, invoice)
+```
 
 ---
 
-## 5. API Endpoints
+## 5. Repository Layer
 
-| Metodo | Path | Handler | Descrizione |
+**File:** `internal/repository/firestore.go`
+
+Collezioni Firestore usate:
+
+| Collezione | Contenuto |
+|---|---|
+| `invoices` | Documenti `Invoice` (1 doc per fattura, ID = Invoice.ID) |
+| `ledger_entries` | Documenti `LedgerEntry` (ID auto-generato se vuoto) |
+
+| Metodo | Operazione Firestore |
+|---|---|
+| `GetInvoice(ctx, id)` | `invoices/{id}` → `DataTo(&Invoice)` |
+| `UpdateInvoice(ctx, inv)` | `invoices/{id}.Set(ctx, inv)` (upsert) |
+| `SaveLedgerEntry(ctx, entry)` | `ledger_entries/{id}.Set(ctx, entry)` |
+| `GetTotalPaidForInvoice(ctx, invoiceID)` | `ledger_entries.Where("invoiceId","==",id)` + sum |
+
+> **Nota:** `NewFinanceRepository` restituisce `error` (non `log.Fatalf`) — comportamento più robusto rispetto al Registry Service. L’errore viene propagato e gestito in `main.go`.
+
+---
+
+## 6. Service Discovery
+
+**Definita in:** `cmd/finance/main.go`
+
+Servizio: `finance-service` | Versione: `1.0.0`
+
+| Metodo | Path | Auth | Stato |
 |---|---|---|---|
-| `PATCH` | `/api/v1/invoices/:id/issue` | `IssueInvoice` | DRAFT → ISSUED, lock immutabile, genera PDF via Document Service |
-| `POST` | `/api/v1/ledger` | `RegisterTransaction` | Registra pagamento + riconciliazione automatica |
-| `GET` | `/_discover` | `GetDiscovery` | Service Discovery (fuori dal Guard) |
+| `PATCH` | `/api/v1/finance/invoices/:id/issue` | ✅ | ✅ Attivo |
+| `POST` | `/api/v1/finance/ledger` | ✅ | ✅ Attivo |
+| `GET` | `/_discover` | ❌ No | ✅ Fuori dal Guard |
 
-### 5.1 `PATCH /api/v1/invoices/:id/issue`
+---
 
-**Nessun body richiesto.** L'ID viene letto dal path param.
+## 7. API Endpoints
 
-**Risposta successo (200):**
+### `PATCH /api/v1/finance/invoices/:id/issue`
+
+Emette una fattura DRAFT, genera il documento PDF e la blocca in stato immutabile.
+
+**Nessun body richiesto.** L’ID fattura passa come path parameter.
+
+**Risposta `200 OK`:**
 ```json
 {
   "success": true,
   "data": {
     "status": "ISSUED",
     "message": "Fattura emessa e bloccata con successo"
-  }
+  },
+  "meta": null
 }
 ```
 
-**Risposta errore (400):**
+**Errori:**
+
+| Codice | Chiave | Causa |
+|---|---|---|
+| `400` | `ERP_LOCK_ERROR` | Fattura già emessa o flag `immutable: true` |
+| `400` | `ERP_LOCK_ERROR` | Errore chiamata a Document Service |
+
+---
+
+### `POST /api/v1/finance/ledger`
+
+Registra un pagamento nel libro giornale e innesca la riconciliazione automatica.
+
+**Body:**
 ```json
 {
-  "success": false,
-  "error": {
-    "code": "ERP_LOCK_ERROR",
-    "message": "il documento è già emesso e non può essere modificato"
-  }
+  "entityId":  "uuid-entita",
+  "invoiceId": "uuid-fattura",
+  "amount":    1500.00,
+  "type":      "CREDIT",
+  "method":    "BANK_TRANSFER"
 }
 ```
 
-### 5.2 `POST /api/v1/ledger`
+> **Validazione handler:** `invoiceId` obbligatorio, `amount` deve essere `> 0`. Il campo `timestamp` viene impostato dal service layer — ignorare eventuali valori inviati dal client.
 
-**Body — `LedgerEntry` (parziale):**
-
-| Campo | Tipo | Obbligatorio | Note |
-|---|---|---|---|
-| `invoiceId` | `string` | ✅ | Fattura da riconciliare |
-| `amount` | `float64` | ✅ | Deve essere > 0 |
-| `entityId` | `string` | No | ID entità pagante |
-| `type` | `string` | No | `DEBIT` \| `CREDIT` |
-| `method` | `string` | No | `STRIPE` \| `BANK_TRANSFER` |
-
-> `id` e `timestamp` sono impostati automaticamente dal service layer.
-
-**Risposta successo (200):**
+**Risposta `200 OK`:**
 ```json
 {
   "success": true,
   "data": {
     "message": "Pagamento registrato, riconciliazione effettuata"
-  }
+  },
+  "meta": null
 }
 ```
 
----
+**Errori:**
 
-## 6. Service Discovery
-
-**Definita in:** `internal/handlers/discovery.go`
-
-A differenza degli altri servizi, il Finance Service gestisce la discovery con un **handler Go dedicato** (non tramite `nexus.RegisterDiscovery`). Espone correttamente i 2 endpoint con metodo, path, summary e `authRequired: true`.
-
-```json
-{
-  "serviceName": "finance-service",
-  "version": "1.0.0",
-  "endpoints": [
-    { "path": "/api/v1/invoices/:id/issue", "method": "PATCH", "authRequired": true },
-    { "path": "/api/v1/ledger",             "method": "POST",  "authRequired": true }
-  ]
-}
-```
-
-> ✅ **Questo è l'unico servizio con discovery compilata correttamente.** `ssg-nexus-document-service` ha ancora `Endpoints: []` vuoto.
+| Codice | Chiave | Causa |
+|---|---|---|
+| `400` | `INVALID_PAYLOAD` | JSON malformato |
+| `400` | `VALIDATION_ERROR` | `invoiceId` vuoto o `amount <= 0` |
+| `500` | `LEDGER_ERROR` | Errore salvataggio Firestore o riconciliazione |
 
 ---
 
-## 7. Dipendenza Inter-servizi
+## 8. Chiamate Inter-Service
 
-Il Finance Service chiama direttamente il Document Service via HTTP durante `IssueInvoice`:
+Il Finance Service chiama direttamente `ssg-nexus-document-service` tramite `nexus.NexusClient`.
 
 ```
 Finance Service
   |
-  | POST {DOC_SERVICE_URL}/api/v1/documents/generate
-  | Header: Authorization (via nexusClient)
-  | Body: { "type": "INVOICE", "data": <invoice> }
+  | POST {DOCUMENT_SERVICE_URL}/api/v1/documents/generate
+  | Body: { "type": "INVOICE", "data": <Invoice> }
+  | Auth: nexusClient.Do() (header INTERNAL_SECRET iniettato dall'SDK)
+  |
   v
-Document Service  ← ENDPOINT NON ANCORA IMPLEMENTATO
+Document Service
+  |
+  | Response: { "data": { "documentId": "doc-uuid" } }
+  v
+Finance Service salva Invoice.DocumentRef = documentId
 ```
 
-La chiamata usa `nexus.NexusClient.Do()` che gestisce l'autenticazione inter-servizio con il token `INTERNAL_SECRET`.
+> `DOCUMENT_SERVICE_URL` deve essere impostato come variabile d’ambiente. Se vuota, `generateDocument` fallisce con errore HTTP.
 
 ---
 
-## 8. Variabili d'Ambiente
+## 9. Variabili d’Ambiente
 
-| Variabile | Descrizione | Obbligatoria |
+| Variabile | Descrizione | Comportamento se assente |
 |---|---|---|
-| `GCP_PROJECT_ID` | Project ID GCP per Firestore | ✅ Sì |
-| `DOC_SERVICE_URL` | URL base del Document Service (es. `https://doc-service-xxx.run.app`) | ✅ Sì |
-| `GATEWAY_URL` | URL del Gateway per l'handshake Discovery | ✅ Sì |
-| `SERVICE_URL` | URL Cloud Run di questo servizio | ✅ Sì |
-| `INTERNAL_SECRET` | Token condiviso Gateway ↔ Servizio | ✅ Sì |
-| `PORT` | Porta HTTP (default `8080`) | No |
+| `GOOGLE_CLOUD_PROJECT` | Project ID GCP per Firestore | Warning + fallback `"ssg-nexus-dev"` |
+| `DOCUMENT_SERVICE_URL` | URL base di `ssg-nexus-document-service` | Errore a runtime su `IssueInvoice` |
+| `GATEWAY_URL` | URL Gateway per handshake discovery | Richiesta dall’SDK |
+| `SERVICE_URL` | URL Cloud Run di questo servizio | Richiesta dall’SDK |
+| `INTERNAL_SECRET` | Token condiviso Gateway ↔ Servizio | Richiesta dall’SDK |
+| `PORT` | Porta HTTP | Default `8080` |
+
+> **Differenza dal Registry:** `GOOGLE_CLOUD_PROJECT` è un warning (non fatal) con fallback su `ssg-nexus-dev`. Il servizio si avvia comunque, utile per sviluppo locale.
 
 ---
 
-## 9. Issue Noti e TODO
+## 10. Issue Noti e TODO
 
 | Priorità | Issue | Stato |
 |---|---|---|
-| 🔴 Alta | `POST /api/v1/documents/generate` non esiste nel Document Service — `IssueInvoice` fallirà sempre in produzione | ⏳ Bloccante |
-| 🔴 Alta | Nessun endpoint `POST /invoices` (creazione DRAFT) — le fatture non possono essere create via API | ⏳ Mancante |
-| 🔴 Alta | Nessun endpoint `GET /invoices` / `GET /invoices/:id` — impossibile leggere le fatture | ⏳ Mancante |
-| 🟡 Media | Race condition sulla riconciliazione: doppio pagamento concorrente può settare PAID due volte | ⏳ Aperto |
-| 🟡 Media | `UpdateInvoice` usa `.Set()` (upsert totale) — rischio perdita campi non inclusi nella struct | ⏳ Aperto |
-| 🟡 Media | `ExternalID` generato come `SDI-{anno}-{id[:6]}` — non è sequenziale e non è univoco garantito | ⏳ Aperto |
-| 🟡 Media | `Totals` contiene solo `Gross` — mancano `net`, `tax`, `items` presenti nel vecchio schema doc | ⏳ Aperto |
-| 🟢 Bassa | Nessun endpoint `GET /ledger` per consultare i movimenti | ⏳ Mancante |
+| 🔴 Alta | `POST /invoices` (creazione fattura DRAFT) non implementato — non c’è handler per creare una nuova fattura | ⏳ Mancante |
+| 🔴 Alta | `GET /invoices/:id` non implementato — impossibile leggere una fattura via API | ⏳ Mancante |
+| 🔴 Alta | `ExternalID` generato con `id[:6]` — non garantisce unicità in produzione | ⚠️ Da sostituire |
+| 🔴 Alta | `GetTotalPaidForInvoice` somma tutti i `LedgerEntry` senza filtrare per `Type=CREDIT` — potrebbe contare DEBIT | ⏳ Bug potenziale |
+| 🟡 Media | Nessun controllo se la fattura esiste prima di chiamare `generateDocument` | ⏳ Aperto |
+| 🟡 Media | `nexus.NexusClient{}` inizializzato vuoto in `main.go` — verificare se l’SDK richiede configurazione aggiuntiva | ⏳ Da verificare |
+| 🟡 Media | Nessuna gestione del caso `StatusCancelled` nel ciclo di vita | ⏳ Non implementato |
 | 🟢 Bassa | Nessun test unitario o di integrazione nel repo | ⏳ Aperto |
 
 ---
 
-## 10. Dipendenze Principali
+## 11. Dipendenze Principali
 
 | Package | Scopo |
 |---|---|
-| `github.com/DaniFX/ssg-nexus-sdk` | Guard, NexusClient inter-servizio, Response standard |
+| `github.com/DaniFX/ssg-nexus-sdk` | Guard, NexusClient, Discovery, Response standard |
 | `cloud.google.com/go/firestore` | Persistenza fatture e ledger |
 | `github.com/gin-gonic/gin` | HTTP framework |
-| `github.com/joho/godotenv` | Caricamento `.env` in sviluppo locale |
 
 ---
 
