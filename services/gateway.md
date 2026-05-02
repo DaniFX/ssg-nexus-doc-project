@@ -1,21 +1,25 @@
-# 🔄 SSG Gateway — Specifiche Tecniche
+# 🚪 SSG Gateway — Specifiche Tecniche
 
-> **Repository:** [`ssg-gateway`](https://github.com/DaniFX/ssg-gateway)
-> **Stack:** Go 1.21+, Gin, Firebase Admin SDK, Google OIDC (`idtoken`)
-> **Ruolo:** Unico punto di ingresso pubblico dell’ecosistema SSG Nexus.
+> **Repository:** [`ssg-gateway`](https://github.com/DaniFX/ssg-gateway)  
+> **Stack:** Go 1.21+, Gin, Firebase Auth, Firestore (`ssg-db`), GCP Cloud Run, OIDC (`google/idtoken`)  
+> **Ruolo:** Unico punto di ingresso (API Gateway) per il progetto SSG Nexus. Gestisce autenticazione Firebase JWT, autorizzazione RBAC, routing dinamico verso i microservizi e propagazione dell'identità utente tramite header Nexus.
 
 ---
 
-## 1. Responsabilità
+## 1. Responsabilità del Gateway
 
-Il Gateway svolge **quattro funzioni fondamentali** in sequenza per ogni richiesta in arrivo:
-
-1. **Autenticazione** — Verifica il Firebase JWT e risolve il ruolo utente.
-2. **Propagazione Nexus** — Inietta gli header standard (`X-Nexus-User-ID`, `X-Nexus-Role`, `X-Nexus-Trace-ID`) nella richiesta da inoltrare.
-3. **Routing Dinamico** — Individua il microservizio target tramite tabella di routing caricata da Firestore.
-4. **Proxy OIDC** — Ottiene un token OIDC (Google Identity) e lo usa come `Authorization: Bearer` verso il Cloud Run del microservizio.
-
-> **Regola fondamentale**: Nessun microservizio accetta traffico diretto da internet. Tutto transita dal Gateway.
+| Responsabilità | Implementazione |
+|---|---|
+| Autenticazione JWT Firebase | `FirebaseAuthMiddleware.Authenticate()` |
+| Autorizzazione RBAC per role | `FirebaseAuthMiddleware.RequireRole(...)` |
+| Routing dinamico microservizi | `RouteConfigurator` + Firestore (`services`, `service_endpoints`) |
+| Service Discovery (Push) | `POST /internal/register` + `DiscoveryService.RegisterService()` |
+| Proxy HTTP verso Cloud Run | `createProxyHandler()` con OIDC token injection |
+| Propagazione identità utente | Header `X-Nexus-User-ID`, `X-Nexus-Role`, `X-Nexus-Trace-ID` |
+| Rate Limiting | `RateLimiter` token bucket (10 rps, burst 20) |
+| Migrations database | `ssg-db` migrator al boot |
+| Logging strutturato | `slog.JSONHandler` + GCP Cloud Logging |
+| CORS | Whitelist origini configurate staticamente |
 
 ---
 
@@ -23,258 +27,255 @@ Il Gateway svolge **quattro funzioni fondamentali** in sequenza per ogni richies
 
 ```
 ssg-gateway/
-├── cmd/                        # Entrypoint (main.go)
+├── cmd/
+│   └── gateway/
+│       └── main.go                  # Bootstrap: config, Firebase, migrator, router, handlers
 ├── internal/
-│   ├── config/                 # Config da env (GCP Project, Firebase, etc.)
-│   ├── handlers/               # Handler HTTP (health, discovery push)
+│   ├── config/
+│   │   └── config.go                # Load() — tutte le env var in una struct Config
+│   ├── handlers/
+│   │   ├── auth.go                  # Login (POST /auth/login)
+│   │   ├── health.go                # /health, /ready, /live
+│   │   ├── user.go                  # CRUD utenti (solo admin)
+│   │   ├── role.go                  # CRUD ruoli (solo admin)
+│   │   ├── app.go                   # CRUD app (solo admin)
+│   │   ├── communicator.go          # POST /admin/send-email
+│   │   └── logs.go                  # GET /admin/logs (GCP Cloud Logging)
 │   ├── middleware/
-│   │   ├── auth.go             # FirebaseAuthMiddleware (JWT + Role)
-│   │   ├── ratelimit.go        # Rate limiting per IP / per utente
-│   │   └── logger.go           # Request logging middleware
+│   │   ├── auth.go                  # FirebaseAuthMiddleware: Authenticate(), RequireRole()
+│   │   ├── logger.go                # LoggerContext() — trace ID nel context Gin
+│   │   └── ratelimit.go             # RateLimiter token bucket + CleanupRateLimiters()
+│   ├── models/                      # Eventuale typing locale
 │   └── services/
-│       ├── discovery.go        # DiscoveryService — gestione handshake Push
-│       ├── routing.go          # RouteConfigurator — proxy handler dinamico
-│       ├── firebase.go         # Wrapper firebase-admin SDK
-│       ├── communicator.go     # Client HTTP verso gli altri servizi
-│       └── logging.go          # Wrapper Cloud Logging
-├── .env.example
-└── Dockerfile
+│       ├── discovery.go             # DiscoveryService: RegisterService(), ServiceDiscoveryResponse
+│       ├── routing.go               # RouteConfigurator: Start(), RefreshRoutes(), proxy handler
+│       ├── firebase.go              # FirebaseService: VerifyIDToken(), CreateUser(), ...
+│       ├── logging.go               # LoggingService: GCP Cloud Logging
+│       └── communicator.go          # CommunicatorClient: gRPC verso ssg-mail-reader-service
+└── ssg-db/                          # Submodule: client Firestore condiviso, models, migrations
 ```
 
 ---
 
-## 3. Flusso di una Richiesta
+## 3. Bootstrap (main.go)
+
+Sequenza di avvio in ordine esatto:
 
 ```
-Client
-  |
-  | Authorization: Bearer <Firebase JWT>
-  v
-+--------------------------------------------------------+
-|                    SSG Gateway (Gin)                   |
-|                                                        |
-|  [1] FirebaseAuthMiddleware.Authenticate()             |
-|      ├─ Verifica JWT con firebaseService.VerifyIDToken |
-|      ├─ Estrae uid          -> c.Set("userID")        |
-|      ├─ Estrae email        -> c.Set("userEmail")     |
-|      ├─ Risolve ruolo       -> c.Set("userRole")      |
-|      └─ Inietta negli Header:                         |
-|            X-Nexus-User-ID  = uid                      |
-|            X-Nexus-Role     = ruolo                    |
-|            X-Nexus-Trace-ID = X-Cloud-Trace-Context    |
-|                               (o generato runtime)     |
-|                                                        |
-|  [2] RouteConfigurator.createProxyHandler()            |
-|      ├─ Risolve URL target da Firestore               |
-|      ├─ Copia headers + rimuove hop-by-hop            |
-|      ├─ Ottiene OIDC Token (idtoken.NewTokenSource)    |
-|      └─ Invia richiesta al microservizio Cloud Run     |
-+--------------------------------------------------------+
-             |
-             | Authorization: Bearer <OIDC Token IAM>
-             | X-Nexus-User-ID, X-Nexus-Role, X-Nexus-Trace-ID
-             v
-    +--------------------+    +--------------------+
-    | Registry Service   |    | Finance Service    |  ...
-    | (Cloud Run)        |    | (Cloud Run)        |
-    +--------------------+    +--------------------+
+1. slog.JSONHandler → logger strutturato
+2. godotenv.Load()  → carica .env (warn se assente)
+3. config.Load()    → tutti i valori env in Config struct
+4. services.NewFirebaseService()         → verifica JWT Firebase Admin SDK
+5. db.NewMigrator() + migrator.Migrate() → esegue migrazioni Firestore al boot (FATALE se fallisce)
+6. firestore.NewClientWithClient()       → client condiviso (User, Role, App repos)
+7. middleware.NewFirebaseAuthMiddleware() → istanza auth (appID = "ssg-admin")
+8. services.NewCommunicatorClient()      → gRPC mail (Warning se fallisce, non fatale)
+9. services.NewLoggingService()          → GCP Cloud Logging (Warning se fallisce)
+10. var routeConfigurator *RouteConfigurator  ← predichiarato (closure callback)
+11. services.NewDiscoveryService(callback)    → callback chiama routeConfigurator.RefreshRoutes()
+12. gin.Default() + middleware.LoggerContext()
+13. services.NewRouteConfigurator() → carica rotte attive da Firestore
+14. go routeConfigurator.Start()    → goroutine avvia proxy routes
+15. cors.New()       → whitelist CORS
+16. RateLimiter 10 rps / burst 20 + goroutine cleanup ogni 5m
+17. Registrazione handler statici (health, auth, admin, me)
+18. r.Run(":PORT")
 ```
+
+> **Nota critica:** La pre-dichiarazione di `routeConfigurator` (step 10) prima del `DiscoveryService` (step 11) è intenzionale: la callback di discovery deve poter chiamare `routeConfigurator.RefreshRoutes()`, che al momento della costruzione del DiscoveryService non è ancora inizializzato. La closure cattura il puntatore.
 
 ---
 
-## 4. Autenticazione — `FirebaseAuthMiddleware`
+## 4. Middleware di Autenticazione
 
 **File:** `internal/middleware/auth.go`
 
-### 4.1 Pipeline di verifica
+### 4.1 `Authenticate()` — Flusso JWT Firebase
 
-```go
-func (m *FirebaseAuthMiddleware) Authenticate() gin.HandlerFunc {
-    // 1. Legge header "Authorization: Bearer <token>"
-    // 2. Verifica con m.firebaseService.VerifyIDToken()
-    // 3. Risolve ruolo via m.userRepo.GetUserAppRole()
-    // 4. Se ruolo non trovato -> checkAutoProvision() per admin-email predefinite
-    // 5. Inietta X-Nexus-User-ID, X-Nexus-Role, X-Nexus-Trace-ID nella Request
-    // 6. c.Next() -> proxy handler
-}
+```
+HTTP Request
+  |
+  | [1] Authorization header presente?
+  |     → No  → 401 UNAUTHORIZED (Missing authorization header)
+  |
+  | [2] Ha prefisso "Bearer "?
+  |     → No  → 401 UNAUTHORIZED (Invalid authorization format)
+  |
+  | [3] firebaseService.VerifyIDToken(idToken)
+  |     → Errore → 401 UNAUTHORIZED (Invalid or expired token)
+  |
+  | [4] Estrai userID (token.UID) e userEmail (claims["email"])
+  |     → c.Set("userID"), c.Set("userEmail")
+  |
+  | [5] userRepo.GetUserAppRole(userID, appID="ssg-admin")
+  |     → Errore/nil → checkAutoProvision(userID, userEmail)
+  |         → Email in AdminConfig.Emails? → crea/aggiorna user con role="admin"
+  |         → else → role="viewer" (default)
+  |
+  | [6] c.Set("userRole", role)
+  |
+  | [7] PROPAGAZIONE NEXUS:
+  |     → c.Request.Header.Set("X-Nexus-User-ID", userID)
+  |     → c.Request.Header.Set("X-Nexus-Role", role)
+  |     → X-Nexus-Trace-ID = X-Cloud-Trace-Context (GCP) oppure ssg-trace-{UnixNano}
+  |
+  v
+c.Next() → handler/proxy
 ```
 
-### 4.2 Auto-provisioning Admin
+### 4.2 `RequireRole(allowedRoles...)` — RBAC
 
-Se un utente non ha ancora un ruolo nel database ma la sua email è presente nella lista `adminEmails` (configurata via env), viene **auto-provisionato** come `admin` al primo accesso. Questo permette di inizializzare il sistema senza intervento manuale su Firestore.
+Verifica che `c.Get("userRole")` sia incluso nella lista `allowedRoles`. Se assente o non autorizzato: `403 FORBIDDEN`. Usato esclusivamente sul gruppo `/api/v1/admin`.
 
-### 4.3 Ruoli disponibili
+### 4.3 Auto-Provisioning Admin
 
-| Ruolo | Accesso |
-|---|---|
-| `admin` | Tutti gli endpoint |
-| `viewer` | Default per utenti autenticati senza ruolo esplicito |
-
-> I ruoli sono **estensibili**: il sistema legge il valore stringa da Firestore senza validazione hard-coded. Ogni microservizio può implementare logiche di autorizzazione aggiuntive tramite il Nexus SDK (`HasRole()`).
-
-### 4.4 RequireRole — RBAC
-
-Alcuni endpoint del Gateway stesso usano `RequireRole` per il controllo accessi:
-
-```go
-r.POST("/admin/register", authMiddleware.RequireRole("admin"), handlers.RegisterService)
-```
+Se un utente Firebase non è presente in Firestore **ma** la sua email è in `ADMIN_EMAILS`, viene creato automaticamente con ruolo `admin`. Utile per il primo accesso senza setup manuale del DB.
 
 ---
 
-## 5. Service Discovery — Pattern Push
+## 5. Service Discovery (Push Model)
 
 **File:** `internal/services/discovery.go`
 
-Il Gateway usa un **pattern Push-based**: i microservizi si registrano attivamente all’avvio chiamando l’endpoint del Gateway. Non c’è polling.
+Il Gateway non fa polling verso i microservizi. I microservizi **si auto-registrano** al boot tramite handshake.
 
 ### 5.1 Endpoint di registrazione
 
 ```
-POST /nexus/discover
-Authorization: Bearer <OIDC Token>   (richiesto)
-Content-Type: application/json
+POST /internal/register
+Header: X-Internal-Secret: <INTERNAL_SECRET>
+Header: X-Service-Url: https://mio-servizio.run.app  (oppure metadata.targetUrl)
+Body: ServiceDiscoveryResponse
 ```
 
-### 5.2 Payload di registrazione (`ServiceDiscoveryResponse`)
-
+**`ServiceDiscoveryResponse` (payload di registrazione):**
 ```json
 {
-  "serviceName": "registry-service",
-  "description": "Anagrafica polimorfica SSG Nexus",
-  "version": "1.2.0",
-  "metadata": {
-    "env": "production",
-    "region": "europe-west8"
-  },
+  "serviceName": "finance-service",
+  "description": "Gestione fatture e pagamenti",
+  "version": "1.0.0",
+  "metadata": { "targetUrl": "https://..." },
   "endpoints": [
     {
-      "path": "/entities",
-      "method": "GET",
-      "summary": "Lista entità",
+      "path": "/api/v1/finance/invoices/:id/issue",
+      "method": "PATCH",
+      "summary": "Emette una fattura",
       "authRequired": true,
       "rateLimit": { "requestsPerMinute": 60, "burst": 10 }
-    },
-    {
-      "path": "/entities",
-      "method": "POST",
-      "summary": "Crea entità",
-      "authRequired": true,
-      "rateLimit": { "requestsPerMinute": 30, "burst": 5 }
     }
   ]
 }
 ```
 
-### 5.3 Logica di `RegisterService()`
+### 5.2 Flusso `RegisterService()`
 
 ```
-1. Cerca il servizio per nome in Firestore (collection: services)
-2. Se NON esiste  -> crea nuovo documento Service con IsActive: true
-3. Se esiste      -> aggiorna URL, version, metadata, IsActive: true
-4. Deactiva tutti gli endpoint esistenti per questo servizio
-5. Crea nuovi endpoint dalla lista nel payload
-6. Chiama updateCallback() -> RouteConfigurator.RefreshRoutes()
+[1] serviceRepo.GetAll() → cerca servizio per nome
+[2] Se non esiste → serviceRepo.Create() con IsActive=true
+    Se esiste     → serviceRepo.Update() (URL, Version, IsActive=true)
+[3] endpointRepo.GetByServiceID() → deactivate tutti gli endpoint esistenti
+[4] Per ogni EndpointSpec → endpointRepo.Create() con IsActive=true
+    EndpointID = "{serviceID}-{METHOD}-{path_safe}" (slash→underscore, colon rimossi)
+[5] updateCallback() → RouteConfigurator.RefreshRoutes()
 ```
 
-### 5.4 Generazione ID endpoint
-
-Gli endpoint ID sono generati deterministicamente per evitare duplicati su Firestore:
-
-```go
-// Pattern: {serviceID}-{METHOD}-{path_sanitized}
-// Esempio: registry-service-GET-_entities
-func generateEndpointID(serviceID, path, method string) string {
-    safePath := strings.ReplaceAll(path, "/", "_")
-    safePath = strings.ReplaceAll(safePath, ":", "")
-    return fmt.Sprintf("%s-%s-%s", serviceID, method, safePath)
-}
-```
+> **Idempotenza:** Una re-registrazione disattiva gli endpoint vecchi e crea quelli nuovi. Non ci sono duplicati.
 
 ---
 
-## 6. Routing Dinamico — `RouteConfigurator`
+## 6. Routing Dinamico
 
 **File:** `internal/services/routing.go`
 
-### 6.1 Startup
-
-All’avvio del Gateway, `RouteConfigurator.Start()` legge da Firestore tutti i servizi e gli endpoint attivi (`isActive: true`) e registra dinamicamente le route sul router Gin.
-
-### 6.2 Registrazione route con middleware condizionale
+### 6.1 `RouteConfigurator`
 
 ```go
-// Se l'endpoint dichiara authRequired: true,
-// il middleware JWT viene inserito PRIMA del proxy handler
-if endpoint.AuthRequired {
-    handlersChain = append(handlersChain, r.authMiddleware)
+type RouteConfigurator struct {
+    router         *gin.Engine
+    serviceRepo    repository.ServiceRepository
+    endpointRepo   repository.ServiceEndpointRepository
+    httpClient     *http.Client        // timeout 30s
+    activeRoutes   map[string]*routeInfo  // thread-safe con RWMutex
+    authMiddleware gin.HandlerFunc     // iniettato da main.go
+    tokenSources   map[string]oauth2.TokenSource  // cache OIDC per audience
 }
-handlersChain = append(handlersChain, handler)
-
-// Pattern: /{serviceName}/{endpoint.Path}
-fullPath := servicePath + endpointPath
-r.router.GET(fullPath, handlersChain...)
 ```
 
-### 6.3 Costruzione URL target
+### 6.2 Registrazione rotta con middleware chain
+
+Per ogni endpoint attivo in Firestore:
 
 ```
-URL target = service.URL + requestPath (strippato del prefisso serviceName) + ?queryString
+fullPath = "/" + service.Name + endpoint.Path
+
+handlersChain:
+  Se endpoint.AuthRequired == true:
+    → [authMiddleware.Authenticate()]  ← JWT Firebase validato qui
+  → [createProxyHandler(service, endpoint)]  ← proxy HTTP
+
+router.{METHOD}(fullPath, handlersChain...)
 ```
 
-Esempio:
+**Deduplication:** Se una route con la stessa chiave `{serviceID}:{endpointID}:{method}` esiste già in `activeRoutes`, viene saltata (Gin non permette registrazioni duplicate).
+
+### 6.3 Proxy Handler — Flusso Completo
+
 ```
-Richiesta in arrivo:  GET /registry-service/entities?status=ACTIVE
-service.URL:          https://registry-service-xyz.run.app
-URL target risultante: https://registry-service-xyz.run.app/entities?status=ACTIVE
+Richiesta in arrivo su /{service.Name}/api/v1/...
+  |
+  | [1] Verifica activeRoutes[routeKey] → se non attiva: 404
+  |
+  | [2] Path rewriting:
+  |     requestPath = c.Request.URL.Path
+  |     requestPath = TrimPrefix(requestPath, "/"+service.Name)
+  |     targetURL = service.URL + requestPath + "?" + RawQuery
+  |
+  | [3] Copia headers originali → rimuove hop-by-hop
+  |     (Connection, Keep-Alive, Transfer-Encoding, ...)
+  |
+  | [4] OIDC Token Injection:
+  |     audience = service.URL (trim trailing slash)
+  |     getTokenSource(ctx, audience)  → cache per audience
+  |     tokenSource.Token()  → OIDC JWT firmato con SA Gateway
+  |     proxyReq.Header.Set("Authorization", "Bearer "+oidcToken)
+  |
+  | [5] User Identity Forwarding:
+  |     X-User-Id    = c.Get("userID")
+  |     X-User-Email = c.Get("userEmail")
+  |     X-User-Role  = c.Get("userRole")
+  |     (già presenti X-Nexus-* iniettati da Authenticate() — step 7)
+  |
+  | [6] httpClient.Do(proxyReq) → risposta del microservizio
+  |     Errore → 502 Bad Gateway
+  |
+  | [7] Copia headers risposta → c.Writer.WriteHeader(statusCode)
+  |     io.Copy(c.Writer, resp.Body)
 ```
 
-### 6.4 Refresh Route
-
-Quando un microservizio si registra tramite Push Discovery, `RefreshRoutes()` viene invocato automaticamente tramite callback, rileggendo Firestore e aggiungendo le nuove route al router Gin.
-
-> ⚠️ **Attenzione**: Gin non supporta la rimozione di route a runtime. Le route vengono aggiunte ma mai eliminate. Un servizio deregistrato non sarà più proxiato (endpoint deactivato su Firestore), ma la route Gin resterà registrata e risponderà con `404 Service endpoint not found or no longer active`.
+> **Sicurezza IAM:** Il token OIDC sostituisce il Bearer JWT dell'utente nel trasporto verso Cloud Run. Il microservizio riceve il token di servizio del Gateway (autorizzato IAM), **non** il token Firebase dell'utente. L'identità dell'utente viene propagata separatamente tramite `X-Nexus-User-ID` e `X-Nexus-Role`.
 
 ---
 
-## 7. Proxy OIDC verso Cloud Run
+## 7. Endpoint Statici del Gateway
 
-**File:** `internal/services/routing.go` — `createProxyHandler()`
+Questa è la lista degli endpoint gestiti direttamente dal Gateway (non proxyati).
 
-### 7.1 Perché OIDC
-
-I microservizi su Cloud Run sono configurati con **ingress interno + autenticazione IAM**. Per chiamarli, il Gateway deve presentare un Google OIDC Token con `audience` uguale all’URL base del Cloud Run target.
-
-### 7.2 Caching dei TokenSource
-
-Per evitare di creare un nuovo `TokenSource` ad ogni richiesta (operazione costosa), il `RouteConfigurator` mantiene una cache `map[string]oauth2.TokenSource` protetta da `sync.RWMutex`.
-
-```go
-// Double-checked locking pattern per thread safety
-func (r *RouteConfigurator) getTokenSource(ctx context.Context, audience string) (oauth2.TokenSource, error) {
-    r.tsMu.RLock()
-    ts, exists := r.tokenSources[audience]
-    r.tsMu.RUnlock()
-    if exists { return ts, nil }
-
-    r.tsMu.Lock()
-    defer r.tsMu.Unlock()
-    // ... crea e mette in cache il nuovo TokenSource
-}
-```
-
-### 7.3 Header inoltrati al microservizio
-
-| Header | Valore | Fonte |
-|---|---|---|
-| `Authorization` | `Bearer <OIDC Token>` | Generato da `idtoken.NewTokenSource` |
-| `X-Nexus-User-ID` | Firebase UID utente | Iniettato da `Authenticate()` |
-| `X-Nexus-Role` | Ruolo utente | Iniettato da `Authenticate()` |
-| `X-Nexus-Trace-ID` | Trace ID GCP | `X-Cloud-Trace-Context` o generato runtime |
-| `X-User-Email` | Email utente | Da `c.Get("userEmail")` |
-
-**Header hop-by-hop rimossi** prima di inviare al microservizio:
-`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Te`, `Trailer`, `Transfer-Encoding`, `Upgrade`
+| Metodo | Path | Auth | Ruolo richiesto | Handler |
+|---|---|---|---|---|
+| `GET` | `/health` | ❌ | — | `healthHandler.Health` |
+| `GET` | `/ready` | ❌ | — | `healthHandler.Ready` |
+| `GET` | `/live` | ❌ | — | `healthHandler.Live` |
+| `POST` | `/auth/login` | ❌ | — | `authHandler.Login` |
+| `POST` | `/internal/register` | `X-Internal-Secret` | — | Discovery handshake |
+| `GET` | `/api/v1/public` | ❌ | — | Endpoint di test |
+| `GET` | `/api/v1/me` | ✅ Firebase JWT | any | Profilo utente corrente |
+| `GET` | `/api/v1/admin/stats` | ✅ | `admin` | Statistiche mock |
+| `GET/POST/PUT/DELETE` | `/api/v1/admin/users[/:id]` | ✅ | `admin` | CRUD utenti |
+| `PUT` | `/api/v1/admin/users/:id/role` | ✅ | `admin` | Aggiornamento ruolo |
+| `GET/POST/PUT/DELETE` | `/api/v1/admin/roles[/:id]` | ✅ | `admin` | CRUD ruoli |
+| `GET/POST/PUT/DELETE` | `/api/v1/admin/apps[/:id]` | ✅ | `admin` | CRUD applicazioni |
+| `POST` | `/api/v1/admin/send-email` | ✅ | `admin` | Invio email via Communicator |
+| `GET` | `/api/v1/admin/logs` | ✅ | `admin` | Log GCP Cloud Logging |
 
 ---
 
@@ -282,67 +283,75 @@ func (r *RouteConfigurator) getTokenSource(ctx context.Context, audience string)
 
 **File:** `internal/middleware/ratelimit.go`
 
-Il rate limit è configurato **per endpoint** nel payload di discovery (`rateLimit.requestsPerMinute`, `rateLimit.burst`). Il middleware applica il token bucket algorithm con i valori dichiarati dal microservizio.
+- **Algoritmo:** Token bucket per IP
+- **Limiti:** 10 request/s (rate), burst 20
+- **Cleanup:** goroutine elimina bucket inattivi ogni 5 minuti
+- Applicato **globalmente** su tutto il router (incluse le rotte proxy dinamiche)
 
 ---
 
-## 9. Variabili d’Ambiente
+## 9. CORS
 
-> Riferimento: `.env.example` nel repo `ssg-gateway`
+Configurato staticamente in `main.go`. Origini consentite:
 
-| Variabile | Descrizione | Esempio |
-|---|---|---|
-| `GCP_PROJECT_ID` | ID Progetto GCP | `ssg-prod-123` |
-| `FIREBASE_CREDENTIALS_FILE` | Path al JSON Service Account Firebase | `/secrets/firebase.json` |
-| `APP_ID` | Identificatore applicazione per i ruoli Firestore | `nexus` |
-| `ADMIN_EMAILS` | Email auto-provisionate come `admin` (CSV) | `admin@ssg.it,dev@ssg.it` |
-| `PORT` | Porta HTTP del Gateway | `8080` |
-| `GIN_MODE` | `debug` o `release` | `release` |
-
----
-
-## 10. Implementazione in un Nuovo Microservizio
-
-Per registrare un nuovo microservizio nel Gateway, il servizio deve:
-
-1. **Implementare `/_discover`** (fornito automaticamente dall’SDK Nexus).
-2. **All’avvio**, chiamare `POST /nexus/discover` sul Gateway con il payload `ServiceDiscoveryResponse`.
-3. **Esporre gli endpoint** con il flag `authRequired: true` per tutti gli endpoint protetti.
-4. **Usare il Nexus SDK** per leggere `X-Nexus-User-ID` e `X-Nexus-Role` dalle richieste in arrivo.
-
-Esempio di registrazione all’avvio (Go):
-
-```go
-func registerWithGateway(gatewayURL string) error {
-    payload := ServiceDiscoveryResponse{
-        ServiceName: "my-new-service",
-        Version:     "1.0.0",
-        Endpoints: []EndpointSpec{
-            {Path: "/items", Method: "GET",  AuthRequired: true,  RateLimit: RateLimit{RequestsPerMinute: 60, Burst: 10}},
-            {Path: "/items", Method: "POST", AuthRequired: true,  RateLimit: RateLimit{RequestsPerMinute: 30, Burst: 5}},
-        },
-    }
-    body, _ := json.Marshal(payload)
-    resp, err := http.Post(gatewayURL+"/nexus/discover", "application/json", bytes.NewReader(body))
-    if err != nil || resp.StatusCode != 200 {
-        return fmt.Errorf("gateway registration failed")
-    }
-    return nil
-}
+```
+http://localhost:5173
+http://localhost:3000
+https://ssg-api-99ac0.web.app
+https://ssg-api-99ac0.firebaseapp.com
 ```
 
+Metodi: `GET, POST, PUT, DELETE, OPTIONS` | Headers: `Origin, Content-Type, Authorization` | `AllowCredentials: true`
+
+> ⚠️ **TODO:** Le origini CORS sono hardcodate nel sorgente. In produzione andrebbero spostate in variabile d'ambiente.
+
 ---
 
-## 11. Issue Noti e TODO
+## 10. Variabili d'Ambiente
+
+| Variabile | Descrizione | Comportamento se assente |
+|---|---|---|
+| `PORT` | Porta HTTP | Default `8080` |
+| `ENVIRONMENT` | `development` / `production` | — |
+| `FIREBASE_PROJECT_ID` | Project ID Firebase | Fatale (Firebase init) |
+| `FIREBASE_PRIVATE_KEY` | Chiave privata SA Firebase Admin | Fatale |
+| `FIREBASE_CLIENT_EMAIL` | Email SA Firebase Admin | Fatale |
+| `FIRESTORE_PROJECT_ID` | Project ID Firestore (ssg-db) | Fatale (migrator) |
+| `FIREBASE_WEB_API_KEY` | API Key Web Firebase (per login REST) | `authHandler.Login` non funziona |
+| `INTERNAL_SECRET` | Token condiviso per `/internal/register` | Tutti i register → `401` |
+| `ADMIN_EMAILS` | Lista email admin auto-provisionate | Nessun auto-provisioning |
+
+> **`credentials.json`** è presente nella root del repo (service account GCP). In Cloud Run viene sostituita dall'identità del service account IAM associato al servizio.
+
+---
+
+## 11. Dipendenze Principali
+
+| Package | Scopo |
+|---|---|
+| `github.com/ssg/ssg-db` | Client Firestore condiviso, models, migrations, repositories |
+| `firebase.google.com/go/v4` | Firebase Admin SDK (verifica JWT) |
+| `google.golang.org/api/idtoken` | Generazione token OIDC per Cloud Run IAM |
+| `golang.org/x/oauth2` | TokenSource caching OIDC |
+| `github.com/gin-gonic/gin` | HTTP framework + router dinamico |
+| `github.com/gin-contrib/cors` | Middleware CORS |
+| `github.com/joho/godotenv` | Caricamento `.env` |
+| `log/slog` | Logging strutturato JSON (stdlib Go 1.21+) |
+
+---
+
+## 12. Issue Noti e TODO
 
 | Priorità | Issue | Stato |
 |---|---|---|
-| 🔴 Alta | Route Gin non rimuovibili a runtime (servizi deregistrati lasciano route zombie) | ⏳ Aperto |
-| 🟡 Media | Trace ID generato con `time.Now().UnixNano()` — non UUID standard | ⏳ Aperto |
-| 🟡 Media | `credentials.json` committato nel repo (da spostare in Secret Manager) | ⚠️ Urgente |
-| 🟢 Bassa | Test e2e per il flusso discovery + proxy non implementati | ⏳ Aperto |
-| 🟢 Bassa | `RefreshRoutes()` non thread-safe su Gin (aggiunta route durante traffico live) | ⏳ Aperto |
+| 🔴 Alta | CORS origini hardcodate in `main.go` — non configurabili senza rebuild | ⚠️ Da spostare in env |
+| 🔴 Alta | `GET /api/v1/admin/stats` restituisce dati mock statici (`totalUsers: 100`) | ⏳ Non implementato |
+| 🟡 Media | `credentials.json` committato nella root — rischio esposizione accidentale | ⚠️ Aggiungere a `.gitignore` |
+| 🟡 Media | `RouteConfigurator.RefreshRoutes()` non gestisce route rimosse (solo aggiunta) — un servizio deregistrato mantiene la rotta Gin | ⏳ Aperto |
+| 🟡 Media | `X-Nexus-Trace-ID` generato con `UnixNano` se non presente — non UUID conforme W3C TraceContext | ⏳ Da migliorare |
+| 🟡 Media | Nessun timeout configurabile per il proxy `httpClient` (hardcoded 30s) | ⏳ Aperto |
+| 🟢 Bassa | Nessun test unitario o di integrazione nel repo | ⏳ Aperto |
 
 ---
 
-*Parte del progetto SSG Nexus — vedere [README.md](../README.md) per gli standard globali.*
+*Parte del progetto SSG Nexus — vedere [README.md](../README.md) per la panoramica dei repository.*
