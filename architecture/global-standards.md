@@ -34,7 +34,7 @@ Ogni richiesta che attraversa il Gateway verso un microservizio contiene questi 
 Usare sempre `nexus.FromContext()` — **mai** leggere gli header raw direttamente nel codice business:
 
 ```go
-import "github.com/ssg/ssg-nexus-sdk/pkg/nexus"
+import "github.com/DaniFX/ssg-nexus-sdk/pkg/nexus"
 
 func (h *Handler) GetEntity(c *gin.Context) {
     identity := nexus.FromContext(c.Request.Context())
@@ -56,7 +56,7 @@ if !nexus.HasRole(c.Request.Context(), "editor") {
 }
 ```
 
-**Regola admin bypass**: un utente con ruolo `admin` supera automaticamente qualsiasi check `HasRole()`, indipendentemente dal ruolo richiesto. Questa logica risiede nell’SDK (`context.go`) ed è centralizzata.
+**Regola admin bypass**: un utente con ruolo `admin` supera automaticamente qualsiasi check `HasRole()`, indipendentemente dal ruolo richiesto. Questa logica risiede nell'SDK (`context.go`) ed è centralizzata.
 
 ---
 
@@ -156,7 +156,7 @@ private.Use(nexus.Guard())
 }
 ```
 
-> Il Guard verifica solo la presenza dell’identità. Per logiche RBAC aggiuntive, usare `nexus.HasRole()` all’interno del singolo handler.
+> Il Guard verifica solo la presenza dell'identità. Per logiche RBAC aggiuntive, usare `nexus.HasRole()` all'interno del singolo handler.
 
 ---
 
@@ -195,7 +195,7 @@ func main() {
 }
 ```
 
-### 6.3 Variabili d’ambiente richieste
+### 6.3 Variabili d'ambiente richieste
 
 | Variabile | Descrizione | Esempio |
 |---|---|---|
@@ -203,7 +203,7 @@ func main() {
 | `SERVICE_URL` | URL Cloud Run di questo servizio | `https://my-service-xyz.run.app` |
 | `INTERNAL_SECRET` | Segreto condiviso per autenticare la registrazione | `<valore da Secret Manager>` |
 
-> In assenza di queste variabili l’handshake viene disabilitato silenziosamente con log di warning.
+> In assenza di queste variabili l'handshake viene disabilitato silenziosamente con log di warning.
 
 ---
 
@@ -211,7 +211,7 @@ func main() {
 
 **File SDK:** `ssg-nexus-sdk/pkg/nexus/auth.go`
 
-L’`Authenticator` Firebase è usato **solo dal Gateway**. I microservizi non validano JWT Firebase.
+L'`Authenticator` Firebase è usato **solo dal Gateway**. I microservizi non validano JWT Firebase.
 
 - In produzione (Cloud Run): usa Application Default Credentials automaticamente
 - In locale: usa `credentialsJSON` da file
@@ -245,11 +245,185 @@ type NexusDoc struct {
 - **Soft Delete**: `deletedAt = now()`. Mai `Delete()` su Firestore.
 - **Query liste**: filtrare sempre con `where("deletedAt", "==", null)`.
 - **Immutabilità**: se `immutable == true` → ritornare `ERR_IMMUTABLE_RECORD` su qualsiasi PUT/PATCH.
-- **TenantID**: valorizzato con l’`AppID` del progetto (predisposto per multi-tenant futuro).
+- **TenantID**: valorizzato con l'`AppID` del progetto (predisposto per multi-tenant futuro).
+
+### 8.2 Repository Layer — `repository.Repository`
+
+**File SDK:** `ssg-nexus-sdk/pkg/nexus/repository/firestore.go`
+
+Ogni microservizio usa `repository.NewRepository()` come unico punto di accesso a Firestore. **Non usare mai `firestoreClient.Collection().Doc()` direttamente** nel codice business.
+
+```go
+// Inizializzazione in main.go
+repo := repository.NewRepository(firestoreClient, "entities")
+
+// Create — inietta automaticamente id, createdAt, updatedAt, createdBy
+err := repo.Create(ctx, uuid, dataMap)
+
+// Update — verifica IsLocked() prima di procedere; appende updatedAt
+err := repo.Update(ctx, id, []firestore.Update{
+    {Path: "status", Value: "ACTIVE"},
+})
+
+// SoftDelete — imposta deletedAt; verifica IsLocked()
+err := repo.SoftDelete(ctx, id)
+
+// IsLocked — true se immutable==true OR status=="ISSUED"
+locked, err := repo.IsLocked(ctx, id)
+```
+
+**Ciclo di vita di un record:**
+
+```
+Create()      → inietta: id, createdAt, updatedAt, createdBy (da context)
+Update()      → IsLocked()? ERR_IMMUTABLE_RECORD : appende updatedAt
+SoftDelete()  → IsLocked()? ERR_IMMUTABLE_RECORD : imposta deletedAt
+```
+
+> Il campo `createdBy` viene estratto automaticamente da `nexus.FromContext(ctx).UserID` — non passarlo manualmente nel `dataMap`.
 
 ---
 
-## 9. Stack Tecnologico Standard
+## 9. Navigator Pattern — Filtri & Ordinamento Firestore
+
+**File SDK:** `ssg-nexus-sdk/pkg/nexus/repository/navigator.go`
+
+`ApplyNavigator()` traduce i query parameter URL in filtri Firestore standardizzati. **Esclude sempre i soft-deleted** (`deletedAt == nil`) come comportamento di default.
+
+```go
+// In ogni handler di tipo LIST
+filters := map[string]string{}
+for k, v := range c.Request.URL.Query() {
+    filters[k] = v[0]
+}
+query := repo.ApplyNavigator(
+    firestoreClient.Collection("entities").Query,
+    filters,
+)
+```
+
+### Parametri Supportati
+
+| Query Param | Comportamento | Esempio |
+|---|---|---|
+| `sort=createdAt` | Ordina ASC per il campo | `?sort=createdAt` |
+| `sort=-createdAt` | Ordina DESC (prefisso `-`) | `?sort=-createdAt` |
+| `status=PAID` | Filtro uguaglianza | `?status=PAID` |
+| `type=PERSON` | Filtro uguaglianza | `?type=PERSON` |
+| `limit=N` | ⚠️ Placeholder — da implementare come `query.Limit(n)` | `?limit=20` |
+
+> **Nota:** Il filtro `deletedAt == nil` è sempre applicato prima di qualsiasi altro filtro. Per esporre i record eliminati (es. admin panel) è necessario costruire la query manualmente senza `ApplyNavigator`.
+
+---
+
+## 10. Chiamate Inter-Servizio — `NexusClient`
+
+**File SDK:** `ssg-nexus-sdk/pkg/nexus/client.go`
+
+Quando un microservizio chiama un altro microservizio, **deve** usare `NexusClient.Do()` per propagare automaticamente `X-Nexus-User-ID` e `X-Nexus-Role` dal contesto corrente. Non impostare mai questi header manualmente.
+
+```go
+nc := &nexus.NexusClient{}
+
+// La chiamata propaga automaticamente l'identità dal ctx
+req, _ := http.NewRequest("GET", os.Getenv("REGISTRY_SERVICE_URL")+"/api/v1/registry/entities/"+entityID, nil)
+resp, err := nc.Do(c.Request.Context(), req)
+if err != nil {
+    nexus.Failure(c, 500, nexus.ErrInternal, "Errore chiamata registry", nil)
+    return
+}
+```
+
+**Flusso di propagazione:**
+
+```
+Client  →  Gateway  →  Service A  →  Service B
+             │               │             │
+         verifica JWT    Guard()       Guard()
+         crea Identity   FromContext() FromContext()
+         inietta header  usa UserID    usa UserID
+                         NexusClient   ...
+                         propaga →
+```
+
+> **Regola:** `TraceID` non è ancora propagato da `NexusClient`. Per la tracciabilità distribuita completa, aggiungere manualmente `req.Header.Set("X-Nexus-Trace-ID", identity.TraceID)` fino a quando l'SDK non lo gestirà automaticamente.
+
+---
+
+## 11. Storage GCS — Signed URL V4
+
+**File SDK:** `ssg-nexus-sdk/pkg/nexus/storage/gcs.go`
+
+Il pattern di upload/download su GCS usa esclusivamente **Signed URL V4** (firma via Cloud Run Service Account ADC). Il file non transita mai attraverso il microservizio.
+
+### Flusso Upload
+
+```
+Client → POST /documents/upload-url → Microservizio
+                                           │
+                               GCSClient.GenerateUploadURL(
+                                 objectName,   // es. "documents/{uuid}/file.pdf"
+                                 mimeType,     // es. "application/pdf"
+                                 expiresMin,   // es. 15
+                               )
+                                           │
+                               { "uploadUrl": "https://storage.googleapis.com/..." }
+                                           │
+Client ←──────────────────────────────────┘
+  │
+  └──► PUT signed URL ──► GCS  (upload diretto, senza passare dal backend)
+```
+
+### Flusso Download
+
+```
+Client → GET /documents/{id}/download-url → Microservizio
+                                                 │
+                                 GCSClient.GenerateDownloadURL(
+                                   objectName,  // percorso GCS
+                                   expiresMin,  // es. 60
+                                 )
+                                                 │
+                                 { "downloadUrl": "https://storage.googleapis.com/..." }
+                                                 │
+Client ←─────────────────────────────────────────┘
+  │
+  └──► GET signed URL ──► GCS  (download diretto, link temporaneo)
+```
+
+### Utilizzo
+
+```go
+// Inizializzazione in main.go
+gcs := storage.NewGCSClient(os.Getenv("GCS_BUCKET_NAME"))
+
+// Generare URL upload (PUT, scade in 15 minuti)
+uploadURL, err := gcs.GenerateUploadURL(
+    "documents/"+docID+"/"+fileName,
+    "application/pdf",
+    15,
+)
+if err != nil {
+    nexus.Failure(c, 500, nexus.ErrStorageUpload, "Errore generazione upload URL", nil)
+    return
+}
+
+// Generare URL download (GET, scade in 60 minuti)
+downloadURL, err := gcs.GenerateDownloadURL(
+    "documents/"+docID+"/"+fileName,
+    60,
+)
+if err != nil {
+    nexus.Failure(c, 500, nexus.ErrSignedURLError, "Errore generazione download URL", nil)
+    return
+}
+```
+
+> La firma avviene tramite le **Application Default Credentials** del Service Account Cloud Run. In locale è necessario autenticarsi con `gcloud auth application-default login` o usare una chiave JSON tramite `GOOGLE_APPLICATION_CREDENTIALS`.
+
+---
+
+## 12. Stack Tecnologico Standard
 
 | Componente | Tecnologia | Note |
 |---|---|---|
@@ -266,7 +440,23 @@ type NexusDoc struct {
 
 ---
 
-## 10. Checklist Nuovo Microservizio
+## 13. Variabili d'Ambiente — Schema Completo
+
+| Variabile | Servizi | Obbligatoria | Note |
+|---|---|---|---|
+| `GCP_PROJECT_ID` | Tutti | ✅ | ID progetto GCP. Assenza → `log.Fatal` |
+| `PORT` | Tutti | ✅ | Porta HTTP. **Mai hardcoded**: usare `os.Getenv("PORT")` |
+| `GATEWAY_URL` | Tutti | ✅ | URL Gateway per handshake discovery |
+| `SERVICE_URL` | Tutti | ✅ | URL Cloud Run del servizio stesso |
+| `INTERNAL_SECRET` | Tutti | ✅ | Shared secret per autenticazione inter-servizio |
+| `GCS_BUCKET_NAME` | Document, Mail Reader | ✅ | Nome bucket GCS upload/download |
+| `FIREBASE_CREDENTIALS_JSON` | Gateway | ⚠️ Opzionale | Se assente usa ADC (Cloud Run) |
+| `GOOGLE_CLOUD_PROJECT` | Finance Service | ⚠️ Alternativa | Alias usato da alcune librerie GCP. Preferire `GCP_PROJECT_ID` |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Locale | ⚠️ Solo dev | Path al JSON delle credenziali GCP per sviluppo locale |
+
+---
+
+## 14. Checklist Nuovo Microservizio
 
 Prima del deploy di qualsiasi nuovo servizio nel sistema Nexus:
 
@@ -274,8 +464,14 @@ Prima del deploy di qualsiasi nuovo servizio nel sistema Nexus:
 - [ ] `nexus.Guard()` applicato su tutte le route private
 - [ ] `nexus.RegisterDiscovery()` + `nexus.StartGatewayHandshake()` in `main()`
 - [ ] Tutti i modelli Firestore estendono `NexusDoc`
+- [ ] Accesso Firestore solo via `repository.NewRepository()` — mai chiamate dirette
+- [ ] Liste Firestore usano `ApplyNavigator()` — escludono soft-deleted per default
+- [ ] Chiamate inter-servizio usano `NexusClient.Do()` — non impostare header manualmente
+- [ ] Upload/download file usano `storage.NewGCSClient()` con Signed URL V4
 - [ ] Tutte le risposte usano `nexus.Success()` / `nexus.Failure()`
 - [ ] Tutti gli errori usano le costanti `nexus.Err*`
+- [ ] `PORT` letta da `os.Getenv("PORT")` — **mai hardcoded**
+- [ ] `GCP_PROJECT_ID` verificata con `log.Fatal` se assente
 - [ ] `GATEWAY_URL`, `SERVICE_URL`, `INTERNAL_SECRET` configurati in env / Secret Manager
 - [ ] Nessuna credenziale committata nel repo
 - [ ] Ingress Cloud Run impostato su **interno** (no accesso pubblico diretto)
