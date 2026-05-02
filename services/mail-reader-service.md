@@ -3,7 +3,7 @@
 > **Repository:** [`ssg-mail-reader-service`](https://github.com/DaniFX/ssg-mail-reader-service)
 > **Stack:** Go 1.21+, Gin, `go-imap` (emersion), TLS 1.2+
 > **Ruolo:** Microservizio stateless per la lettura e gestione di caselle email via protocollo IMAP.
-> **Caso d’uso primario:** Lettura di caselle **PEC** (Posta Elettronica Certificata) per l’identificazione e il recupero di **Fatture Elettroniche** (allegati `.xml` e `.p7m`).
+> **Caso d'uso primario:** Lettura di caselle **PEC** (Posta Elettronica Certificata) per l'identificazione e il recupero di **Fatture Elettroniche** (allegati `.xml` e `.p7m`).
 
 ---
 
@@ -15,28 +15,28 @@ Questo design permette a un singolo servizio di gestire caselle email di **clien
 
 ```
 Client
-  |
-  | X-Imap-Host: imaps.pec-provider.it:993
-  | X-Imap-User: azienda@pec.it
-  | X-Imap-Pass: <password>
-  v
+  │
+  │ X-Imap-Host: imaps.pec-provider.it:993
+  │ X-Imap-User: azienda@pec.it
+  │ X-Imap-Pass: <password>
+  ▼
 +---------------------------------------+
 |           SSG Gateway                 |
 |  [1] FirebaseAuthMiddleware (JWT)     |
 |  [2] Proxy con OIDC Token             |
 +---------------------------------------+
-             |
-             v
+             │
+             ▼
 +---------------------------------------+
 |      Mail Reader Service              |
-|  [3] nexus.Guard() -> X-Nexus-User-ID |
+|  [3] nexus.Guard() → X-Nexus-User-ID |
 |  [4] RequireImapHeaders() middleware  |
-|      -> c.Set("imapCreds")            |
-|  [5] Handler -> MailService           |
-|  [6] client.DialTLS() -> IMAP server  |
+|      → c.Set("imapCreds")            |
+|  [5] Handler → MailService           |
+|  [6] client.DialTLS() → IMAP server  |
 +---------------------------------------+
-             |
-             v
+             │
+             ▼
     Server IMAP/PEC (TLS 1.2+)
 ```
 
@@ -46,11 +46,12 @@ Client
 
 ```
 ssg-mail-reader-service/
-├── cmd/                         # Entrypoint (main.go)
+├── cmd/server/
+│   └── main.go              # Bootstrap: router, middleware, handshake Gateway
 ├── internal/
 │   ├── handlers/
 │   │   ├── mail.go             # Handler HTTP per tutte le operazioni IMAP
-│   │   ├── discovery.go        # Definizione contratto API (ServiceDefinition)
+│   │   ├── discovery.go        # GetDiscoveryDoc() — contratto API completo
 │   │   └── health.go           # GET /_health
 │   ├── middleware/
 │   │   └── imap_auth.go        # RequireImapHeaders() — estrae credenziali dagli header
@@ -66,19 +67,71 @@ ssg-mail-reader-service/
 
 ---
 
-## 3. Autenticazione e Middleware Chain
+## 3. Bootstrap (`main.go`)
 
-La catena di middleware per le route private è composta da **due livelli** in serie:
+Sequenza di avvio:
 
-### 3.1 `nexus.Guard()` — Identità Nexus
+1. `gin.SetMode(gin.ReleaseMode)` se `ENV=production`
+2. `registerToGateway()` — lanciato in goroutine background
+3. `router.Group("/api/v1/mail")` + `middleware.RequireImapHeaders()`
+4. Registrazione dei 6 endpoint
+5. `router.Run(":" + port)`
 
-Primo middleware. Verifica che `X-Nexus-User-ID` sia presente (iniettato dal Gateway). Blocca con `401` se assente. Obbligatorio come da standard globali.
+### 3.1 `registerToGateway()` — Handshake con retry
 
-### 3.2 `RequireImapHeaders()` — Credenziali IMAP
+Il servizio usa un meccanismo di registrazione **custom** (non `nexus.StartGatewayHandshake`), con logica di retry esplicita:
+
+```go
+func registerToGateway() {
+    // Lancia la registrazione in goroutine (non blocca il boot)
+    go func() {
+        client := &http.Client{Timeout: 10 * time.Second}
+
+        for i := 0; i < 5; i++ {
+            req, _ := http.NewRequest("POST", gatewayURL+"/internal/register", body)
+            req.Header.Set("Content-Type", "application/json")
+            req.Header.Set("X-Internal-Secret", internalSecret)
+            req.Header.Set("X-Service-Url", serviceURL)  // URL del servizio per il Gateway
+
+            resp, err := client.Do(req)
+            if err == nil && resp.StatusCode == http.StatusOK {
+                log.Println("✅ Handshake completato")
+                return
+            }
+            time.Sleep(5 * time.Second)  // attende 5 sec tra tentativi
+        }
+        log.Println("❌ Impossibile registrarsi dopo 5 tentativi")
+    }()
+}
+```
+
+**Header inviati al Gateway:**
+
+| Header | Valore |
+|---|---|
+| `Content-Type` | `application/json` |
+| `X-Internal-Secret` | `$INTERNAL_SECRET` |
+| `X-Service-Url` | `$SERVICE_URL` (URL Cloud Run del servizio) |
+
+**Payload:** JSON della `GetDiscoveryDoc()` (contratto API completo con tutti gli endpoint).
+
+> **Nota:** A differenza degli altri servizi che usano `nexus.StartGatewayHandshake()`, questo servizio implementa la registrazione manualmente con 5 retry e backoff fisso da 5 secondi. Valutare allineamento all'SDK.
+
+---
+
+## 4. Autenticazione e Middleware Chain
+
+La catena di middleware per le route `/api/v1/mail` è composta da **due livelli** in serie:
+
+### 4.1 `nexus.Guard()` — Identità Nexus
+
+Primo middleware. Verifica che `X-Nexus-User-ID` sia presente (iniettato dal Gateway). Blocca con `401` se assente.
+
+### 4.2 `RequireImapHeaders()` — Credenziali IMAP
 
 **File:** `internal/middleware/imap_auth.go`
 
-Secondo middleware. Verifica la presenza di tutti e tre gli header IMAP obbligatori. In caso di assenza risponde con `400 MISSING_IMAP_CREDENTIALS` e interrompe la catena.
+Secondo middleware. Verifica la presenza di tutti e tre gli header IMAP. In caso di assenza risponde `400 MISSING_IMAP_CREDENTIALS` e chiama `c.Abort()`.
 
 ```go
 func RequireImapHeaders() gin.HandlerFunc {
@@ -88,23 +141,17 @@ func RequireImapHeaders() gin.HandlerFunc {
         pass := c.GetHeader("X-Imap-Pass")
 
         if host == "" || user == "" || pass == "" {
-            c.JSON(400, models.NewErrorResponse(
-                "MISSING_IMAP_CREDENTIALS",
-                "Fornire X-Imap-Host, X-Imap-User e X-Imap-Pass",
-                nil,
-            ))
+            c.JSON(400, models.NewErrorResponse("MISSING_IMAP_CREDENTIALS", "...", nil))
             c.Abort()
             return
         }
-
-        // Inietta nel contesto Gin per gli handler
         c.Set("imapCreds", ImapCredentials{Host: host, Username: user, Password: pass})
         c.Next()
     }
 }
 ```
 
-### 3.3 Header richiesti per ogni richiesta
+### 4.3 Header richiesti per ogni richiesta
 
 | Header | Tipo | Esempio | Note |
 |---|---|---|---|
@@ -113,47 +160,46 @@ func RequireImapHeaders() gin.HandlerFunc {
 | `X-Imap-User` | `string` | `azienda@pec.it` | Username casella email |
 | `X-Imap-Pass` | `string` | `<password>` | Password casella email |
 
-> ⚠️ **Sicurezza**: Le credenziali IMAP viaggiano in chiaro negli header HTTP. La connessione tra client e Gateway **deve** essere HTTPS. In produzione valutare l’uso di token temporanei o vault secrets invece della password diretta.
+> ⚠️ **Sicurezza**: Le credenziali IMAP viaggiano in chiaro negli header HTTP. La connessione client → Gateway **deve** essere HTTPS. In produzione valutare l'uso di token temporanei o vault secrets invece della password diretta.
 
 ---
 
-## 4. Client IMAP — `MailService`
+## 5. Client IMAP — `MailService`
 
 **File:** `internal/service/imap_client.go`
 **Libreria:** [`github.com/emersion/go-imap`](https://github.com/emersion/go-imap)
 
-### 4.1 Connessione TLS
+### 5.1 Connessione TLS
 
 Ogni operazione apre una nuova connessione TLS dedicata e la chiude con `defer c.Logout()`. Il servizio è **completamente stateless** a livello di connessioni.
 
 ```go
 func (s *MailService) connect() (*client.Client, error) {
-    // TLS minimo 1.2, ServerName estratto dall'host (senza porta)
-    // per compatibilità con provider PEC (es. Aruba, Namirial, Legalmail)
+    // Estrae solo l'host (senza porta) per ServerName TLS
+    // necessario per i provider PEC (Aruba, Namirial, Legalmail)
     tlsConfig := &tls.Config{
         ServerName: hostOnly,
         MinVersion: tls.VersionTLS12,
     }
     c, err := client.DialTLS(s.Host, tlsConfig)
-    // ...
     c.Login(s.Username, s.Password)
 }
 ```
 
-### 4.2 Operazioni disponibili
+### 5.2 Operazioni disponibili
 
-| Metodo | Protocollo IMAP | Descrizione |
+| Metodo | Comando IMAP | Descrizione |
 |---|---|---|
 | `ListFolders()` | `LIST "" *` | Recupera tutte le cartelle della casella |
 | `Search(criteria)` | `UID SEARCH` + `UID FETCH ENVELOPE` | Ricerca per Subject/From/Body, ritorna preview |
-| `GetMessage(folder, uid)` | `UID FETCH BODY[]` + `ENVELOPE` | Fetch completo: body text, HTML, allegati |
+| `GetMessage(folder, uid)` | `UID FETCH BODY[] ENVELOPE` | Fetch completo: body text, HTML, allegati |
 | `CreateFolder(name)` | `CREATE` | Crea nuova cartella IMAP |
 | `MoveMessage(src, uid, dst)` | `UID MOVE` | Sposta email tra cartelle |
 | `DeleteMessage(folder, uid)` | `UID STORE +FLAGS \\Deleted` | Marca per eliminazione (non rimuove fisicamente) |
 
-> **Nota su `DeleteMessage`**: L’implementazione aggiunge il flag `\Deleted` IMAP standard. La rimozione fisica avviene solo dopo un comando `EXPUNGE`, non implementato nel servizio. Valutare se aggiungere `EXPUNGE` esplicito.
+> ⚠️ **`DeleteMessage`**: aggiunge il flag `\Deleted` IMAP. La rimozione fisica richiede `EXPUNGE`, non implementato. Valutare se aggiungere `EXPUNGE` esplicito dopo il `UidStore`.
 
-### 4.3 Identificazione Fatture Elettroniche
+### 5.3 Identificazione Fatture Elettroniche
 
 In `GetMessage()`, il parser MIME (`go-message/mail`) scansiona gli allegati e identifica le Fatture Elettroniche per estensione:
 
@@ -167,64 +213,35 @@ case *mail.AttachmentHeader:
     }
 ```
 
-**⚠️ TODO aperto**: La logica di salvataggio su GCS e analisi XML SDI è predisposta ma non ancora implementata (commento nel codice). È il prossimo step naturale per integrare il flusso Fattura Elettronica con il Finance Service.
+> 🔴 **TODO aperto**: La logica di salvataggio su GCS e analisi XML SDI è predisposta ma non implementata. È il prossimo step naturale per integrare il flusso Fattura Elettronica con il Finance Service.
 
 ---
 
-## 5. API Endpoints
+## 6. API Endpoints
 
-Base path: `/api/v1/mail` (prefisso aggiunto automaticamente dal Gateway tramite `serviceName`)
+Base path: `/api/v1/mail` — tutti protetti da `RequireImapHeaders()` + `nexus.Guard()`.
 
-Tutti gli endpoint richiedono `authRequired: true` (Nexus Guard + Firebase JWT).
+| Metodo | Path | Handler | Descrizione |
+|---|---|---|---|
+| `GET` | `/api/v1/mail/folders` | `GetFolders` | Lista cartelle IMAP |
+| `POST` | `/api/v1/mail/folders` | `CreateFolder` | Crea nuova cartella |
+| `POST` | `/api/v1/mail/search` | `SearchEmails` | Ricerca email con filtri |
+| `GET` | `/api/v1/mail/messages/:uid` | `GetMessage` | Dettaglio email completo |
+| `PUT` | `/api/v1/mail/messages/:uid/move` | `MoveMessage` | Sposta email in altra cartella |
+| `DELETE` | `/api/v1/mail/messages/:uid` | `DeleteMessage` | Marca email come eliminata |
+| `GET` | `/_discover` | `GetDiscovery` | Contratto API (pubblico) |
 
-### `GET /api/v1/mail/folders`
+### Esempi Richiesta/Risposta
 
-Recupera la lista di tutte le cartelle della casella IMAP.
-
-**Risposta:**
+**`POST /api/v1/mail/search`**
 ```json
+// Request
 {
-  "success": true,
-  "data": {
-    "folders": ["INBOX", "Sent", "Trash", "Fatture/2025", "Fatture/2026"]
-  }
+  "folder": "INBOX",
+  "subject": "Fattura",
+  "from": "sdi@pec.fatturapa.it"
 }
-```
-
----
-
-### `POST /api/v1/mail/folders`
-
-Crea una nuova cartella IMAP.
-
-**Body:**
-```json
-{ "name": "Fatture/2026" }
-```
-
-**Risposta:** `201 Created`
-```json
-{ "success": true, "data": { "message": "Cartella creata con successo" } }
-```
-
----
-
-### `POST /api/v1/mail/search`
-
-Cerca email nel server IMAP in base a filtri combinabili.
-
-**Body (`SearchCriteria`):**
-```json
-{
-  "folder":       "INBOX",
-  "subject":      "Fattura",
-  "from":         "sdi@pec.fatturapa.it",
-  "bodyContains": "partita IVA"
-}
-```
-
-**Risposta (array di `EmailPreview`):**
-```json
+// Response
 {
   "success": true,
   "data": {
@@ -235,17 +252,7 @@ Cerca email nel server IMAP in base a filtri combinabili.
 }
 ```
 
-> I campi `subject`, `from` e `bodyContains` sono opzionali. La ricerca viene eseguita via `UID SEARCH` su tutti i campi forniti (AND logico).
-
----
-
-### `GET /api/v1/mail/messages/:uid`
-
-Recupera il contenuto completo di una singola email.
-
-**Query param:** `?folder=INBOX` (default `INBOX`)
-
-**Risposta (`EmailDetail`):**
+**`GET /api/v1/mail/messages/1042?folder=INBOX`**
 ```json
 {
   "success": true,
@@ -262,43 +269,27 @@ Recupera il contenuto completo di una singola email.
 }
 ```
 
----
-
-### `PUT /api/v1/mail/messages/:uid/move`
-
-Sposta un’email in una cartella di destinazione.
-
-**Query param:** `?folder=INBOX` (cartella sorgente)
-
-**Body:**
+**`PUT /api/v1/mail/messages/1042/move?folder=INBOX`**
 ```json
 { "destinationFolder": "Fatture/2026" }
 ```
 
 ---
 
-### `DELETE /api/v1/mail/messages/:uid`
-
-Marca un’email con il flag `\Deleted`.
-
-**Query param:** `?folder=INBOX`
-
----
-
-## 6. Modelli di Dati
+## 7. Modelli di Dati
 
 **File:** `internal/models/mail.go`
 
 ```go
 // SearchCriteria — payload per POST /search
 type SearchCriteria struct {
-    Folder       string `json:"folder"`        // default "INBOX"
+    Folder       string `json:"folder"`               // default "INBOX"
     Subject      string `json:"subject,omitempty"`
     From         string `json:"from,omitempty"`
     BodyContains string `json:"bodyContains,omitempty"`
 }
 
-// EmailPreview — usato nelle liste (solo metadati, senza body)
+// EmailPreview — metadati, usato nelle liste (senza body)
 type EmailPreview struct {
     UID     uint32    `json:"uid"`
     Subject string    `json:"subject"`
@@ -316,50 +307,55 @@ type EmailDetail struct {
 
 ---
 
-## 7. Service Discovery
+## 8. Service Discovery
 
 **File:** `internal/handlers/discovery.go`
 
-Il servizio si registra al Gateway come `mail-reader-service` con `version: 1.0.0`. Tutti e 6 gli endpoint dichiarano `authRequired: true`.
+A differenza degli altri servizi che usano `nexus.ServiceDefinition`, questo servizio costruisce il discovery doc come `gin.H` direttamente nel codice. Il contratto è completo e include `inputSchema` per gli endpoint con body.
 
-Endpoint esposto per ispezione: `GET /_discover`
+- Servizio: `mail-reader-service` | Versione: `1.0.0`
+- Tutti e 6 gli endpoint dichiarano `authRequired: true`
+- Endpoint di ispezione esposto: `GET /_discover`
+
+> **Nota:** Il formato di discovery è diverso dallo standard `nexus.ServiceDefinition` degli altri servizi. Valutare allineamento all'SDK per uniformità.
 
 ---
 
-## 8. Variabili d’Ambiente
+## 9. Variabili d'Ambiente
 
-> Riferimento: `.env.example` nel repo `ssg-mail-reader-service`
-
-| Variabile | Descrizione | Esempio |
+| Variabile | Descrizione | Obbligatoria |
 |---|---|---|
-| `GATEWAY_URL` | URL del Gateway per la registrazione push | `https://ssg-gateway-xyz.run.app` |
-| `SERVICE_URL` | URL Cloud Run di questo servizio | `https://mail-reader-xyz.run.app` |
-| `INTERNAL_SECRET` | Segreto condiviso per l’handshake con il Gateway | `<valore da Secret Manager>` |
-| `PORT` | Porta HTTP | `8080` |
+| `GATEWAY_URL` | URL del Gateway per la registrazione push | ✅ Sì |
+| `SERVICE_URL` | URL Cloud Run di questo servizio | ✅ Sì |
+| `INTERNAL_SECRET` | Segreto condiviso per l'handshake con il Gateway | ✅ Sì |
+| `ENV` | Se `production` abilita `gin.ReleaseMode` | No |
+| `PORT` | Porta HTTP (default `8080`) | No |
 
 ---
 
-## 9. Dipendenze Principali
+## 10. Dipendenze Principali
 
-| Package | Versione | Scopo |
-|---|---|---|
-| `github.com/emersion/go-imap` | v1.x | Client IMAP RFC 3501 |
-| `github.com/emersion/go-message` | v0.x | Parser MIME multipart (body + allegati) |
-| `github.com/gin-gonic/gin` | v1.9+ | HTTP framework |
-| `github.com/DaniFX/ssg-nexus-sdk` | latest | Guard, Discovery, Response standard |
+| Package | Scopo |
+|---|---|
+| `github.com/emersion/go-imap` | Client IMAP RFC 3501 |
+| `github.com/emersion/go-message` | Parser MIME multipart (body + allegati) |
+| `github.com/gin-gonic/gin` | HTTP framework |
+| `github.com/DaniFX/ssg-nexus-sdk` | Guard, Response standard |
 
 ---
 
-## 10. Issue Noti e TODO
+## 11. Issue Noti e TODO
 
 | Priorità | Issue | Stato |
 |---|---|---|
-| 🔴 Alta | Credenziali IMAP in chiaro negli header HTTP — nessun layer di cifratura aggiuntivo | ⚠️ Design by choice, documentare rischio |
+| 🔴 Alta | Credenziali IMAP in chiaro negli header — password diretta senza cifratura aggiuntiva | ⚠️ Design by choice, documentare rischio |
 | 🔴 Alta | Logica salvataggio allegati XML/P7M su GCS non implementata (TODO nel codice) | ⏳ Aperto |
 | 🟡 Media | `DeleteMessage` non esegue `EXPUNGE` — le email non vengono rimosse fisicamente | ⏳ Aperto |
+| 🟡 Media | Discovery doc in formato `gin.H` custom invece di `nexus.ServiceDefinition` | ⏳ Da allineare |
+| 🟡 Media | `registerToGateway()` custom con 5 retry invece di `nexus.StartGatewayHandshake()` | ⏳ Da allineare all'SDK |
 | 🟡 Media | Ogni operazione apre e chiude una connessione TLS — costoso per operazioni batch | ⏳ Da valutare connection pooling |
-| 🟢 Bassa | Nessun rate limiting sulle ricerche IMAP (query lente su caselle grandi) | ⏳ Aperto |
-| 🟢 Bassa | Test di integrazione presenti ma disabilitati in CI (richiedono server IMAP reale) | ⏳ Aperto |
+| 🟢 Bassa | Nessun rate limiting sulle ricerche IMAP | ⏳ Aperto |
+| 🟢 Bassa | Test di integrazione presenti ma richiedono server IMAP reale (non eseguibili in CI) | ⏳ Aperto |
 
 ---
 
