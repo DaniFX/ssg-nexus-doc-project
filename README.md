@@ -1,7 +1,7 @@
 # 📘 SSG Nexus — Documento di Riferimento (Source of Truth)
 
-> **Versione:** 1.1.0
-> **Data:** 2026-05-02
+> **Versione:** 1.2.0
+> **Data:** 2026-05-06
 > **Stato:** Attivo — Documento normativo per tutti i contributori del progetto Nexus.
 
 ---
@@ -270,6 +270,9 @@ Il documento copre:
 | [§13 Variabili d'Ambiente](./architecture/global-standards.md#13-variabili-dambiente--schema-completo) | Schema completo di tutte le env var |
 | [§14 Checklist Deploy](./architecture/global-standards.md#14-checklist-nuovo-microservizio) | 16 punti obbligatori prima del deploy |
 
+> 🗂️ **Modello Dati Condiviso (Frontend + BFF):** [`architecture/data-model.md`](./architecture/data-model.md)
+> TypeScript types, relazioni tra entità, state machine, convenzioni API e validazioni Zod per il portal frontend.
+
 ---
 
 ## 8. Contratti e JSON Schema
@@ -315,6 +318,7 @@ Il documento copre:
 - [x] `services/mail-reader-service.md`
 - [x] `architecture/global-standards.md`
 - [x] `contracts/schemas.json`
+- [x] `architecture/data-model.md` — TypeScript types, relazioni, state machine, API BFF
 - [ ] `services/gateway.md` — routing rules e discovery
 - [ ] `architecture/deployment.md` — diagramma infrastruttura GCP
 - [ ] `architecture/data-flows.md` — flussi inter-servizio
@@ -322,4 +326,4 @@ Il documento copre:
 
 ---
 
-*Documento aggiornato il 2026-05-02 v1.1.0 — da aggiornare ad ogni decisione architetturale rilevante.*
+*Documento aggiornato il 2026-05-06 v1.2.0 — da aggiornare ad ogni decisione architetturale rilevante.*
